@@ -3,6 +3,7 @@ import { createRoot } from "react-dom/client";
 import {
   BrowserRouter,
   Link,
+  NavLink,
   useNavigate,
   useParams,
   useLocation,
@@ -24,7 +25,6 @@ import {
   Terminal,
   Search,
   Menu,
-  BrainCircuit,
   UserRound,
   ChevronDown,
   FileSpreadsheet,
@@ -35,6 +35,33 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import "./style.css";
 const API = "/api";
+function configureProblemEditor(monaco) {
+  monaco.editor.defineTheme("itclub-python", {
+    base: "vs-dark",
+    inherit: true,
+    rules: [
+      { token: "keyword", foreground: "F47CFF", fontStyle: "bold" },
+      { token: "type.identifier", foreground: "45E6C8" },
+      { token: "identifier", foreground: "77BDFB" },
+      { token: "string", foreground: "B8E986" },
+      { token: "number", foreground: "FFCB6B" },
+      { token: "comment", foreground: "8494A8", fontStyle: "italic" },
+      { token: "delimiter", foreground: "D7E3F0" },
+      { token: "operator", foreground: "89DDFF" },
+    ],
+    colors: {
+      "editor.background": "#1E242E",
+      "editor.foreground": "#D7E3F0",
+      "editor.lineHighlightBackground": "#293241",
+      "editorLineNumber.foreground": "#65758B",
+      "editorLineNumber.activeForeground": "#B8C7D9",
+      "editorCursor.foreground": "#64FFDA",
+      "editor.selectionBackground": "#315A7D99",
+      "editorIndentGuide.background1": "#334155",
+      "editorIndentGuide.activeBackground1": "#64748B",
+    },
+  });
+}
 async function request(path, options = {}) {
   const token = localStorage.getItem("token");
   const isForm = options.body instanceof FormData;
@@ -50,17 +77,19 @@ async function request(path, options = {}) {
   if (!r.ok) throw Error(j.error || `HTTP ${r.status}`);
   return j;
 }
+function UserAvatar({ user, className = "" }) {
+  const initials = (user?.username || "?").slice(0, 2).toUpperCase();
+  return (
+    <span className={`user-avatar ${className}`.trim()}>
+      {user?.avatar ? <img src={user.avatar} alt="" /> : initials}
+    </span>
+  );
+}
 function App() {
   const [user, setUser] = useState(
     JSON.parse(localStorage.getItem("user") || "null"),
   );
-  const [route, setRoute] = useState(location.pathname);
   const [drawer, setDrawer] = useState(false);
-  useEffect(() => {
-    const cb = () => setRoute(location.pathname);
-    window.addEventListener("popstate", cb);
-    return () => window.removeEventListener("popstate", cb);
-  }, []);
   const logout = () => {
     localStorage.removeItem("token");
     localStorage.removeItem("user");
@@ -73,7 +102,6 @@ function App() {
         <div className="navwrap">
           <Link to="/" className="brand">
             <img src="/itclub-logo.png" alt="IT CLUB" />
-            <span className="brand-sub">JUDGE</span>
           </Link>
           <button className="mobile-toggle" onClick={() => setDrawer(!drawer)}>
             <Menu size={22} />
@@ -82,34 +110,39 @@ function App() {
             className={drawer ? "nav open" : "nav"}
             onClick={() => setDrawer(false)}
           >
-            <Link to="/" className={route === "/" ? "home-nav-link active" : "home-nav-link"}>
+            <NavLink to="/" end>
               <House size={16} /> Home
-            </Link>
-            <Link to="/problems">
-              <Layers3 size={16} /> Problems
-            </Link>
-            <Link to="/contests">
+            </NavLink>
+            <NavLink to="/problems">
+              <Layers3 size={16} /> AI Arena
+            </NavLink>
+            <NavLink to="/contests">
               <Trophy size={16} /> Contests
-            </Link>
-            <Link to="/ranklist">
+            </NavLink>
+            <NavLink to="/ranklist">
               <ChartNoAxesCombined size={16} /> Ranklist
-            </Link>
-            <Link to="/submissions">
+            </NavLink>
+            <NavLink to="/submissions">
               <Activity size={16} /> My submissions
-            </Link>
+            </NavLink>
             {user?.role === "admin" && (
-              <Link to="/admin/problems">
+              <NavLink to="/admin/problems">
                 <ShieldCheck size={16} /> Admin
-              </Link>
+              </NavLink>
             )}
           </nav>
           <div className="account">
             {user ? (
               <>
-                <span className="username">
-                  <UserRound size={17} />
-                  {user.username}
-                </span>
+                <Link
+                  className="account-profile"
+                  to="/profile"
+                  title="View profile"
+                >
+                  <UserAvatar user={user} className="account-avatar" />
+                  <span className="account-name">{user.username}</span>
+                  <ChevronRight className="account-profile-arrow" size={13} />
+                </Link>
                 <button className="btn ghost small" onClick={logout}>
                   <LogOut size={16} /> Logout
                 </button>
@@ -141,6 +174,9 @@ function RouterContent({ user, setUser }) {
   if (p === "/") return <Home />;
   if (p === "/login" || p === "/register")
     return <AuthPage setUser={setUser} register={p === "/register"} />;
+  if (p === "/profile") return <ProfilePage user={user} setUser={setUser} />;
+  if (p.startsWith("/profile/"))
+    return <ProfilePage user={user} setUser={setUser} username={decodeURIComponent(p.split("/")[2])} />;
   if (p === "/problems") return <Problems />;
   if (p.startsWith("/problems/"))
     return (
@@ -165,18 +201,15 @@ function Home() {
       <section className="hero">
         <div className="shell hero-grid">
           <div>
-            <span className="eyebrow">
-              <span className="pulse" /> IT CLUB · AI LEARNING PLATFORM
-            </span>
             <h1>
-              Build solutions.
+              ITClub Arena
               <br />
-              <span>Prove your thinking.</span>
+              <span>Cùng nhau chiến thắng</span>
             </h1>
             <p>
-              Practice algorithms, NumPy, PyTorch, and machine learning
-              challenges. Submit your solutions and follow each test case live
-              as it is evaluated.
+              Contest sẽ diễn ra vào 14:00 chiều thứ Hai hằng tuần
+              <br />
+              Tham gia để luyện tập, thử sức và nâng cao kỹ năng của bạn
             </p>
             <div className="actions">
               <Link className="btn bright" to="/problems">
@@ -185,17 +218,6 @@ function Home() {
               <Link className="btn outline-light" to="/ranklist">
                 View leaderboard
               </Link>
-            </div>
-            <div className="hero-points">
-              <span>
-                <ShieldCheck size={17} /> Isolated evaluation
-              </span>
-              <span>
-                <Activity size={17} /> Real-time results
-              </span>
-              <span>
-                <BrainCircuit size={17} /> AI challenges
-              </span>
             </div>
           </div>
           <div className="hero-art">
@@ -246,57 +268,6 @@ function Home() {
           </div>
         </div>
       </section>
-      <section className="shell">
-        <div className="section-head">
-          <div>
-            <span className="section-kicker">GET STARTED</span>
-            <h2>Choose your challenge</h2>
-            <p>
-              One platform for coding exercises and data science assessments.
-            </p>
-          </div>
-        </div>
-        <div className="feature-grid">
-          <Link to="/problems" className="feature">
-            <span className="feature-icon">
-              <Code2 />
-            </span>
-            <h3>Algorithmic problems</h3>
-            <p>
-              Write Python functions and validate against hidden test cases in
-              an isolated runtime.
-            </p>
-            <span className="feature-link">
-              Browse tasks <ChevronRight size={16} />
-            </span>
-          </Link>
-          <Link to="/problems" className="feature">
-            <span className="feature-icon">
-              <BrainCircuit />
-            </span>
-            <h3>Machine learning</h3>
-            <p>
-              Practice with NumPy and PyTorch in AI-focused coding challenges.
-            </p>
-            <span className="feature-link">
-              Explore AI <ChevronRight size={16} />
-            </span>
-          </Link>
-          <Link to="/problems" className="feature">
-            <span className="feature-icon">
-              <FileSpreadsheet />
-            </span>
-            <h3>CSV competitions</h3>
-            <p>
-              Upload predictions and get scores from classification, ranking,
-              and regression metrics.
-            </p>
-            <span className="feature-link">
-              Upload predictions <ChevronRight size={16} />
-            </span>
-          </Link>
-        </div>
-      </section>
     </>
   );
 }
@@ -319,7 +290,7 @@ function AuthPage({ setUser, register }) {
       localStorage.setItem("token", data.token);
       localStorage.setItem("user", JSON.stringify(data.user));
       setUser(data.user);
-      nav("/problems");
+      nav("/");
     } catch (e) {
       setError(e.message);
     } finally {
@@ -391,6 +362,147 @@ function AuthPage({ setUser, register }) {
     </div>
   );
 }
+async function resizeAvatar(file) {
+  if (file.size > 8 * 1024 * 1024) throw Error("Original image must be 8 MB or smaller.");
+  const bitmap = await createImageBitmap(file);
+  const side = Math.min(bitmap.width, bitmap.height);
+  const sourceX = (bitmap.width - side) / 2;
+  const sourceY = (bitmap.height - side) / 2;
+  const canvas = document.createElement("canvas");
+  canvas.width = 320;
+  canvas.height = 320;
+  const context = canvas.getContext("2d");
+  context.drawImage(bitmap, sourceX, sourceY, side, side, 0, 0, 320, 320);
+  bitmap.close();
+  const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/webp", 0.82));
+  if (!blob) throw Error("Could not process this image.");
+  return new File([blob], "avatar.webp", { type: "image/webp" });
+}
+function ProfilePage({ user, setUser, username = null }) {
+  const isOwn = !username || username === user?.username;
+  const targetUsername = username || user?.username;
+  const [profile, setProfile] = useState(isOwn ? user : null);
+  const [form, setForm] = useState({ username: user?.username || "", email: user?.email || "" });
+  const [loading, setLoading] = useState(Boolean(targetUsername));
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const [success, setSuccess] = useState("");
+  const avatarInput = useRef(null);
+  const applyProfile = (next, syncAccount = false) => {
+    setProfile(next);
+    if (syncAccount) {
+      setForm({ username: next.username, email: next.email });
+      setUser(next);
+      localStorage.setItem("user", JSON.stringify(next));
+    }
+  };
+  useEffect(() => {
+    if (!targetUsername) return;
+    setLoading(true);
+    setError("");
+    request(isOwn ? "/auth/me" : `/users/${encodeURIComponent(targetUsername)}/profile`)
+      .then((data) => applyProfile(data.user, isOwn))
+      .catch((err) => setError(err.message))
+      .finally(() => setLoading(false));
+  }, [targetUsername, isOwn]);
+  const saveAccount = async (event) => {
+    event.preventDefault();
+    setSaving(true);
+    setError("");
+    setSuccess("");
+    try {
+      const data = await request("/auth/profile", { method: "PUT", body: JSON.stringify(form) });
+      applyProfile(data.user, true);
+      setSuccess("Account information updated.");
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setSaving(false);
+    }
+  };
+  const changeAvatar = async (event) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    setSaving(true);
+    setError("");
+    setSuccess("");
+    try {
+      const resized = await resizeAvatar(file);
+      const body = new FormData();
+      body.append("avatar", resized);
+      const data = await request("/auth/avatar", { method: "POST", body });
+      applyProfile({ ...profile, avatar: data.avatar }, true);
+      setSuccess("Avatar cropped and resized successfully.");
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setSaving(false);
+    }
+  };
+  if (!targetUsername) {
+    return (
+      <div className="shell page profile-guest">
+        <h1>Your profile</h1><p>Sign in to view and edit your account.</p>
+        <Link className="btn primary" to="/login">Sign in</Link>
+      </div>
+    );
+  }
+  if (loading) return <div className="shell page"><p>Loading profile...</p></div>;
+  if (!profile) return <div className="shell page profile-guest"><h1>Profile unavailable</h1><p>{error || "Profile not found."}</p><Link className="btn ghost" to="/ranklist">Back to ranklist</Link></div>;
+  return (
+    <div className="shell page profile-page">
+      <section className="profile-hero">
+        <UserAvatar user={profile} className="profile-avatar" />
+        <div className="profile-identity">
+          <h1>{profile.username}</h1>
+          {isOwn && <p>{profile.email}</p>}
+          <small>Member since {new Date(profile.created_at).toLocaleDateString()}</small>
+        </div>
+        <div className="profile-stats">
+          <div><b>{profile.solved || 0}</b><span>Problems solved</span></div>
+          <div><b>{profile.attempts || 0}</b><span>Submissions</span></div>
+        </div>
+      </section>
+
+      <section className={`profile-content${isOwn ? "" : " profile-content-public"}`}>
+        <div className="panel profile-summary">
+          <div className="panel-head"><UserRound size={18} /> Profile overview</div>
+          <dl>
+            <div><dt>Username</dt><dd>{profile.username}</dd></div>
+            {isOwn && <div><dt>Email</dt><dd>{profile.email}</dd></div>}
+            <div><dt>Member since</dt><dd>{new Date(profile.created_at).toLocaleDateString()}</dd></div>
+            {isOwn && <div><dt>User ID</dt><dd>{profile.id}</dd></div>}
+          </dl>
+        </div>
+
+        {isOwn && (
+          <div className="panel profile-editor">
+            <div className="panel-head"><ShieldCheck size={18} /> Edit account</div>
+            <div className="profile-avatar-editor">
+              <UserAvatar user={profile} className="profile-edit-avatar" />
+              <div>
+                <strong>Profile picture</strong>
+                <p>Choose an image up to 8 MB. It will be center-cropped and resized to 320 × 320 WebP.</p>
+                <button className="btn ghost small" type="button" disabled={saving} onClick={() => avatarInput.current?.click()}>
+                  <Upload size={15} /> Change avatar
+                </button>
+                <input ref={avatarInput} className="avatar-input" type="file" accept="image/png,image/jpeg,image/webp" onChange={changeAvatar} />
+              </div>
+            </div>
+            <form className="profile-form" onSubmit={saveAccount}>
+              <label>Username<input required minLength={3} maxLength={40} value={form.username} onChange={(e) => setForm({ ...form, username: e.target.value })} /></label>
+              <label>Email address<input required type="email" maxLength={255} value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} /></label>
+              {error && <div className="error-msg" role="alert">{error}</div>}
+              {success && <div className="success-msg" role="status">{success}</div>}
+              <button className="btn primary" disabled={saving}>{saving ? "Saving..." : "Save account"}</button>
+            </form>
+          </div>
+        )}
+      </section>
+    </div>
+  );
+}
 function useProblems() {
   const [items, setItems] = useState([]);
   const [error, setError] = useState("");
@@ -404,39 +516,78 @@ function useProblems() {
 function Pill({ children }) {
   return <span className="pill">{children}</span>;
 }
+function problemPresentation(problem) {
+  const text = `${problem.category || ""} ${problem.title || ""} ${problem.slug || ""}`.toLowerCase();
+  if (problem.kind === "csv") {
+    if (/natural language|\bnlp\b|text|language/.test(text)) {
+      return { track: "Natural Language Processing", tech: "Natural Language Processing", tone: "nlp" };
+    }
+    if (/computer vision|\bcv\b|image|vision/.test(text)) {
+      return { track: "Computer Vision", tech: "Computer Vision", tone: "vision" };
+    }
+    return { track: "Machine Learning", tech: "Machine Learning", tone: "machine-learning" };
+  }
+  const tech = text.includes("pytorch")
+    ? "PyTorch"
+    : text.includes("numpy")
+      ? "NumPy"
+      : "Python";
+  return { track: "Function Only", tech, tone: tech.toLowerCase() };
+}
+function problemSummary(description) {
+  const text = String(description || "")
+    .replace(/[`#>*_[\]()~-]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return text.length > 150 ? `${text.slice(0, 147)}...` : text;
+}
 function Problems() {
   const { items, error } = useProblems();
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState("all");
-  const shown = items.filter(
-    (p) =>
+  const shown = items.filter((p) => {
+    const meta = problemPresentation(p);
+    const searchable = `${p.title} ${p.category} ${p.slug} ${meta.track} ${meta.tech}`;
+    return (
       (filter === "all" || p.kind === filter) &&
-      (p.title + " " + p.category).toLowerCase().includes(search.toLowerCase()),
-  );
+      searchable.toLowerCase().includes(search.toLowerCase())
+    );
+  });
   return (
-    <div className="shell page">
-      <div className="page-heading">
-        <span className="section-kicker">CHALLENGE LIBRARY</span>
-        <h1>Problem set</h1>
-        <p>
-          Explore programming and AI tasks. Select a challenge to start grading.
-        </p>
+    <div className="shell page arena-page">
+      <div className="arena-banner">
+        <div className="arena-banner-copy">
+          <span className="arena-kicker">AI OLYMPIC PRACTICE</span>
+          <h1>AI Arena</h1>
+          <p>
+            Khám phá các thử thách lập trình và trí tuệ nhân tạo, luyện tập
+            trên dữ liệu thực tế và chinh phục từng bài toán.
+          </p>
+          <div className="arena-stats">
+            <span><Trophy size={16} /><b>{items.length}</b> challenges</span>
+            <span><FileSpreadsheet size={16} /><b>{items.filter((p) => p.kind === "csv").length}</b> AI Tracks</span>
+            <span><CheckCircle2 size={16} /> Automated evaluation</span>
+          </div>
+        </div>
+        <div className="arena-banner-mark" aria-hidden="true">
+          <span><Layers3 size={54} /></span>
+        </div>
       </div>
-      <div className="panel">
+      <div className="arena-toolbar">
         <div className="filters">
           <div className="search">
             <Search size={17} />
             <input
-              placeholder="Search problems..."
+              placeholder="Search challenges..."
               value={search}
               onChange={(e) => setSearch(e.target.value)}
             />
           </div>
           <div className="tabs">
             {[
-              ["all", "All problems"],
-              ["code", "Code judge"],
-              ["csv", "CSV judge"],
+              ["all", "All challenges"],
+              ["code", "Function Only"],
+              ["csv", "AI Tracks"],
             ].map(([key, label]) => (
               <button
                 key={key}
@@ -448,56 +599,44 @@ function Problems() {
             ))}
           </div>
         </div>
-        {error && <p className="error-msg">{error}</p>}
-        <div className="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>#</th>
-                <th>Problem</th>
-                <th>Category</th>
-                <th>Type</th>
-                <th>Difficulty</th>
-                <th></th>
-              </tr>
-            </thead>
-            <tbody>
-              {shown.map((p, i) => (
-                <tr key={p.slug}>
-                  <td className="muted">{String(i + 1).padStart(2, "0")}</td>
-                  <td>
-                    <Link className="problem-title" to={"/problems/" + p.slug}>
-                      {p.title}
-                    </Link>
-                    <div className="muted text-xs">{p.slug}</div>
-                  </td>
-                  <td>
-                    <Pill>{p.category}</Pill>
-                  </td>
-                  <td>
-                    <span className="type-label">
-                      {p.kind === "csv" ? "CSV" : "Function only"}
-                    </span>
-                  </td>
-                  <td>
-                    <span
-                      className={"difficulty " + p.difficulty.toLowerCase()}
-                    >
-                      {p.difficulty}
-                    </span>
-                  </td>
-                  <td>
-                    <Link to={"/problems/" + p.slug}>
-                      <ChevronRight size={18} />
-                    </Link>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-        <div className="table-footer">Showing {shown.length} problems</div>
       </div>
+      {error && <p className="error-msg">{error}</p>}
+      <div className="arena-grid">
+        {shown.map((p, i) => {
+          const meta = problemPresentation(p);
+          return (
+            <Link
+              key={p.slug}
+              className={`arena-card arena-card-${meta.tone}`}
+              to={`/problems/${p.slug}`}
+            >
+              <div className="arena-card-cover">
+                <div className="arena-card-symbol">
+                  {p.kind === "csv" ? <FileSpreadsheet size={28} /> : <Code2 size={28} />}
+                </div>
+                <strong>{meta.track}</strong>
+                <span className="arena-card-number">#{String(i + 1).padStart(2, "0")}</span>
+              </div>
+              <div className="arena-card-body">
+                <h2>{p.title}</h2>
+                <p>{problemSummary(p.description)}</p>
+                <span className="arena-tech">{meta.tech}</span>
+                <div className="arena-card-footer">
+                  <span className="arena-card-stats">
+                    <span><Activity size={14} /> {p.submissions || 0} submissions</span>
+                    <span><UserRound size={14} /> {p.participants || 0} participants</span>
+                  </span>
+                  <b>Open challenge <ChevronRight size={16} /></b>
+                </div>
+              </div>
+            </Link>
+          );
+        })}
+      </div>
+      {!shown.length && !error && (
+        <div className="panel empty">No challenges match your search.</div>
+      )}
+      <div className="arena-count">Showing {shown.length} challenges</div>
     </div>
   );
 }
@@ -508,15 +647,55 @@ function ProblemPage({ slug, user }) {
   const [file, setFile] = useState(null);
   const [job, setJob] = useState(null);
   const [submitting, setSubmitting] = useState(false);
-  const navigate = useNavigate();
+  const [activeTab, setActiveTab] = useState("description");
+  const [mySubmissions, setMySubmissions] = useState([]);
+  const [solutions, setSolutions] = useState([]);
+  const [solutionSearch, setSolutionSearch] = useState("");
+  const [tabLoading, setTabLoading] = useState(false);
+  const draftKey = `itclub-draft:${user?.id || "guest"}:${slug}`;
   useEffect(() => {
     request("/problems/" + slug)
       .then((d) => {
         setProblem(d.problem);
-        setCode(d.problem.starter || "");
+        setCode(localStorage.getItem(draftKey) ?? d.problem.starter ?? "");
       })
       .catch((e) => setError(e.message));
   }, [slug]);
+  useEffect(() => {
+    if (activeTab !== "my" || !user) return;
+    setTabLoading(true);
+    request(`/submissions?slug=${encodeURIComponent(slug)}`)
+      .then((data) => setMySubmissions(data.submissions || []))
+      .catch((err) => setError(err.message))
+      .finally(() => setTabLoading(false));
+  }, [activeTab, user, slug, job]);
+  useEffect(() => {
+    if (activeTab !== "solutions") return;
+    setTabLoading(true);
+    request(`/problems/${encodeURIComponent(slug)}/solutions`)
+      .then((data) => setSolutions(data.solutions || []))
+      .catch((err) => setError(err.message))
+      .finally(() => setTabLoading(false));
+  }, [activeTab, slug]);
+  const updateCode = (value) => {
+    const next = value ?? "";
+    setCode(next);
+    localStorage.setItem(draftKey, next);
+  };
+  const resetCode = () => {
+    const starter = problem?.starter || "";
+    setCode(starter);
+    localStorage.setItem(draftKey, starter);
+  };
+  const visibleSolutions = solutions.filter((solution) => {
+    const query = solutionSearch.trim().toLowerCase();
+    if (!query) return true;
+    return [solution.username, solution.status, solution.kind, solution.metric]
+      .filter(Boolean)
+      .join(" ")
+      .toLowerCase()
+      .includes(query);
+  });
   const send = async () => {
     setError("");
     setSubmitting(true);
@@ -535,7 +714,6 @@ function ProblemPage({ slug, user }) {
         });
       }
       setJob(data.id);
-      navigate("/submissions/" + data.id);
     } catch (e) {
       setError(e.message);
     } finally {
@@ -546,31 +724,41 @@ function ProblemPage({ slug, user }) {
     return <div className="shell page error-msg">{error}</div>;
   if (!problem) return <div className="shell page">Loading...</div>;
   return (
-    <div className="shell page">
+    <div className="shell page problem-detail-page">
       <div className="crumbs">
-        <Link to="/problems">Problems</Link>
+        <Link to="/problems">AI Arena</Link>
         <ChevronRight size={15} />
         {problem.title}
       </div>
-      <div className="problem-head">
+      <section className="problem-workspace">
+        <nav className="problem-tabs" aria-label="Problem sections">
+        {[
+          ["description", "Description"],
+          ["submit", "Submit"],
+          ["my", "My submission"],
+          ["solutions", "All Solutions"],
+        ].map(([key, label]) => (
+          <button key={key} className={activeTab === key ? "active" : ""} onClick={() => { setActiveTab(key); setError(""); }}>
+            {label}
+          </button>
+        ))}
+        </nav>
+        <div className="problem-workspace-body">
+          <div className="problem-head">
         <div>
           <h1>{problem.title}</h1>
           <div className="meta">
             <Pill>{problem.category}</Pill>
-            <span className={"difficulty " + problem.difficulty.toLowerCase()}>
-              {problem.difficulty}
-            </span>
             <span className="type-label">
-              {problem.kind === "csv" ? "CSV prediction" : "Python function"}
+              {problem.kind === "csv" ? "AI Track" : "Function Only"}
             </span>
           </div>
         </div>
-      </div>
-      <div className="solve-grid">
-        <article className="panel description">
-          <div className="panel-head">
-            <Layers3 size={19} /> Problem description
           </div>
+
+      {activeTab === "description" && (
+        <article className="description problem-description">
+          <div className="problem-description-title">Description</div>
           <div className="panel-body">
             <div className="markdown-content"><ReactMarkdown remarkPlugins={[remarkGfm]}>{problem.description}</ReactMarkdown></div>
             {problem.kind === "code" ? (
@@ -604,16 +792,27 @@ function ProblemPage({ slug, user }) {
             )}
           </div>
         </article>
-        <article className="panel editor-panel">
-          <div className="panel-head">
-            <Code2 size={19} />{" "}
-            {problem.kind === "code" ? "Solution editor" : "Prediction upload"}
-            <span className="editor-badge">
-              {problem.kind === "code" ? "Python 3" : "CSV"}
-            </span>
-          </div>
+      )}
+
+      {activeTab === "submit" && (
+        <article className="panel editor-panel problem-submit-panel">
+          {problem.kind === "csv" && (
+            <div className="panel-head">
+              <Upload size={19} /> Prediction upload
+              <span className="editor-badge">CSV</span>
+            </div>
+          )}
           {problem.kind === "code" ? (
-            <div className="monaco-code"><MonacoEditor height="430px" language="python" theme="vs-dark" value={code} onChange={value => setCode(value ?? "")} options={{minimap:{enabled:false},fontSize:14,automaticLayout:true,scrollBeyondLastLine:false,tabSize:4,wordWrap:"on"}} /></div>
+            <div className="code-editor-shell">
+              <div className="code-editor-toolbar">
+                <span><Code2 size={15} /> Source Code</span>
+                <div className="code-toolbar-actions">
+                  <span className="code-language">Python 3</span>
+                  <button className="editor-reset" type="button" onClick={resetCode}>Reset template</button>
+                </div>
+              </div>
+              <div className="monaco-code"><MonacoEditor height="600px" language="python" theme="itclub-python" beforeMount={configureProblemEditor} value={code} onChange={updateCode} options={{minimap:{enabled:false},overviewRulerLanes:0,hideCursorInOverviewRuler:true,fontSize:14,automaticLayout:true,scrollBeyondLastLine:false,tabSize:4,wordWrap:"on",bracketPairColorization:{enabled:true},guides:{bracketPairs:true,indentation:true},semanticHighlighting:{enabled:true}}} /></div>
+            </div>
           ) : (
             <div className="upload-area">
               <Upload size={40} />
@@ -643,9 +842,81 @@ function ProblemPage({ slug, user }) {
               </button>
             )}
           </div>
+          {job && (
+            <div className="submission-queued success-msg">
+              Submission queued. Your draft is still saved.
+              <Link to={`/submissions/${job}`}>View live result <ChevronRight size={15} /></Link>
+            </div>
+          )}
           {error && <p className="error-msg pad">{error}</p>}
         </article>
-      </div>
+      )}
+
+      {activeTab === "my" && (
+        <section className="panel problem-submissions-panel">
+          <div className="panel-head"><Activity size={18} /> My submissions</div>
+          {!user ? (
+            <div className="empty"><p>Sign in to view your submissions for this challenge.</p><Link className="btn primary small" to="/login">Sign in</Link></div>
+          ) : tabLoading ? <p className="empty">Loading submissions...</p> : (
+            <div className="table-wrap">
+              <table>
+                <thead><tr><th>Status</th><th>Result</th><th>Score</th><th>Submitted</th><th></th></tr></thead>
+                <tbody>{mySubmissions.map((submission) => (
+                  <tr key={submission.id}>
+                    <td><span className={`status ${submission.status}`}>{submission.status}</span></td>
+                    <td>{submission.passed}/{submission.total}</td>
+                    <td>{submission.score == null ? "—" : Number(submission.score).toFixed(4)}</td>
+                    <td>{new Date(submission.created_at).toLocaleString()}</td>
+                    <td><Link to={`/submissions/${submission.id}`}>Details <ChevronRight size={15} /></Link></td>
+                  </tr>
+                ))}</tbody>
+              </table>
+              {!mySubmissions.length && <p className="empty">You have not submitted this challenge yet.</p>}
+            </div>
+          )}
+        </section>
+      )}
+
+      {activeTab === "solutions" && (
+        <section className="panel solutions-table-panel">
+          <div className="solutions-toolbar">
+            <div>
+              <h3>All submissions</h3>
+              <p>Submission history from club members.</p>
+            </div>
+            <label className="solutions-search">
+              <Search size={16} />
+              <input value={solutionSearch} onChange={(event) => setSolutionSearch(event.target.value)} placeholder="Search user or status..." />
+            </label>
+          </div>
+          {tabLoading ? <p className="empty">Loading submissions...</p> : (
+            <div className="table-wrap">
+              <table className="solutions-table">
+                <thead><tr><th>#</th><th>User</th><th>Judge status</th><th>Result</th><th>Language</th><th>Submitted at</th></tr></thead>
+                <tbody>{visibleSolutions.map((solution) => (
+                  <tr key={solution.id}>
+                    <td className="solution-id">#{String(solution.id).slice(0, 8)}</td>
+                    <td>
+                      <Link className="solution-user" to={`/profile/${encodeURIComponent(solution.username)}`}>
+                        <UserAvatar user={solution} className="solution-avatar" />
+                        <b>{solution.username}</b>
+                      </Link>
+                    </td>
+                    <td><span className={`status ${solution.status}`}>{solution.status.replaceAll("_", " ")}</span></td>
+                    <td>{solution.kind === "csv" ? (solution.score == null ? "—" : `${Number(solution.score).toFixed(4)} ${solution.metric || ""}`) : `${solution.passed}/${solution.total} tests`}</td>
+                    <td>{solution.kind === "csv" ? "AI Track" : "Python"}</td>
+                    <td>{new Date(solution.created_at).toLocaleString()}</td>
+                  </tr>
+                ))}</tbody>
+              </table>
+              {!visibleSolutions.length && <p className="empty">No member submissions found.</p>}
+            </div>
+          )}
+          {error && <p className="error-msg">{error}</p>}
+        </section>
+      )}
+        </div>
+      </section>
     </div>
   );
 }
@@ -881,31 +1152,24 @@ function Ranklist() {
       .then((data) => setUsers(data.users || []))
       .catch((err) => setError(err.message));
   }, []);
-  // The API determines rank and tie-breaks; only change the visual presentation.
+  // The API ranks distinct solved problems first and total attempts second.
   const podiumOrder = [1, 0, 2].filter((index) => index < users.length);
   const medals = ["🥇", "🥈", "🥉"];
   const places = ["1st place", "2nd place", "3rd place"];
   return (
     <div className="shell page ranklist-page">
-      <div className="page-heading">
-        <span className="section-kicker">COMMUNITY</span>
-        <h1>Ranklist</h1>
-        <p>Members ranked by accepted solutions.</p>
-      </div>
       {error && <p className="error-msg" role="alert">{error}</p>}
       {users.length > 0 && (
-        <section className="rank-podium" aria-label="Top three on the leaderboard">
+        <section className={`rank-podium rank-podium-${Math.min(users.length, 3)}`} aria-label="Top three on the leaderboard">
           {podiumOrder.map((index) => {
             const user = users[index];
             return (
               <article key={user.username} className={`rank-podium-card rank-position-${index + 1}`}>
                 <div className="rank-medal" aria-hidden="true">{medals[index]}</div>
-                <div className="rank-avatar" aria-hidden="true">
-                  {(user.username || "?").slice(0, 2).toUpperCase()}
-                </div>
+                <UserAvatar user={user} className="rank-avatar" />
                 <div className="rank-place">{places[index]}</div>
-                <strong className="rank-name">{user.username}</strong>
-                <div className="rank-score"><b>{user.accepted}</b><span>accepted</span></div>
+                <Link className="rank-name" to={`/profile/${encodeURIComponent(user.username)}`}>{user.username}</Link>
+                <div className="rank-score"><b>{user.solved}</b><span>problems solved</span></div>
                 <div className="rank-attempts">{user.attempts} attempts</div>
                 <div className="rank-stand" aria-hidden="true">{index + 1}</div>
               </article>
@@ -915,13 +1179,13 @@ function Ranklist() {
       )}
       <div className="panel table-wrap">
         <table>
-          <thead><tr><th>Rank</th><th>User</th><th>Accepted submissions</th><th>Attempts</th></tr></thead>
+          <thead><tr><th>Rank</th><th>User</th><th>Solved problems</th><th>Attempts</th></tr></thead>
           <tbody>
             {users.map((user, index) => (
               <tr key={user.username} className={index < 3 ? `rank-row rank-row-${index + 1}` : undefined}>
                 <td>{index < 3 ? <span className="rank-table-medal">{medals[index]} <b>#{index + 1}</b></span> : <b>#{index + 1}</b>}</td>
-                <td><span className="problem-title">{user.username}</span></td>
-                <td>{user.accepted}</td>
+                <td><Link className="rank-table-user" to={`/profile/${encodeURIComponent(user.username)}`}><UserAvatar user={user} className="rank-table-avatar" /><span className="problem-title">{user.username}</span></Link></td>
+                <td>{user.solved}</td>
                 <td>{user.attempts}</td>
               </tr>
             ))}

@@ -20,6 +20,7 @@ if (!secret || secret.length < 32) throw Error('JWT_SECRET must be at least 32 c
 const app = express();
 app.disable('x-powered-by'); app.use(helmet()); app.use(express.json({ limit: '300kb' }));
 app.use('/api/auth', rateLimit({ windowMs: 15 * 60 * 1000, limit: 25, standardHeaders: 'draft-7', legacyHeaders: false }));
+const avatarUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 512 * 1024, files: 1, fields: 0 } });
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws', maxPayload: 8192 });
 const sockets = new Map();
@@ -42,6 +43,20 @@ const publicProblem = p => ({ slug: p.slug, title: p.title, category: p.category
 const asyncRoute = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 const tokenFor = user => jwt.sign({ id: user.id, username: user.username, role: user.role || 'student' }, secret, { expiresIn: '12h', issuer: 'itclub-judge' });
 const verify = token => jwt.verify(token, secret, { issuer: 'itclub-judge' });
+async function profileFor(id) {
+    const q = await pool.query(`SELECT u.id,u.username,u.email,u.role,u.avatar,u.created_at,
+        COUNT(DISTINCT s.problem_slug) FILTER(WHERE s.status='accepted')::int AS solved,
+        COUNT(s.id)::int AS attempts
+        FROM users u LEFT JOIN submissions s ON s.user_id=u.id WHERE u.id=$1 GROUP BY u.id`, [id]);
+    return q.rows[0] || null;
+}
+async function publicProfileFor(username) {
+    const q = await pool.query(`SELECT u.username,u.avatar,u.created_at,
+        COUNT(DISTINCT s.problem_slug) FILTER(WHERE s.status='accepted')::int AS solved,
+        COUNT(s.id)::int AS attempts
+        FROM users u LEFT JOIN submissions s ON s.user_id=u.id WHERE u.username=$1 GROUP BY u.id`, [username]);
+    return q.rows[0] || null;
+}
 function auth(req, res, next) { try { const t = (req.headers.authorization || '').replace(/^Bearer /, ''); req.user = verify(t); next() } catch { res.status(401).json({ error: 'Authentication required' }) } }
 async function admin(req, res, next) {
     try { const q = await pool.query('SELECT role FROM users WHERE id=$1', [req.user.id]); if (q.rows[0]?.role !== 'admin') return res.status(403).json({ error: 'Administrator access required' }); next() } catch (e) { next(e) }
@@ -93,7 +108,12 @@ async function gradeCsv(id, slug, buffer) {
     } catch (e) { await update(id, { status: 'failed', error: String(e.response?.data?.detail || e.message).slice(0, 500) }, 'completed') }
 }
 const seededProblems = JSON.parse(await readFile(new URL('./problems.json', import.meta.url), 'utf8'));
-async function listProblems() { const q = await pool.query('SELECT data FROM problems WHERE active=true ORDER BY created_at,slug'); return q.rows.map(r => r.data) }
+async function listProblems() {
+    const q = await pool.query(`SELECT p.data,COUNT(s.id)::int AS submissions,COUNT(DISTINCT s.user_id)::int AS participants
+        FROM problems p LEFT JOIN submissions s ON s.problem_slug=p.slug
+        WHERE p.active=true GROUP BY p.slug,p.data,p.created_at ORDER BY p.created_at,p.slug`);
+    return q.rows;
+}
 async function findProblem(slug) { const q = await pool.query('SELECT data FROM problems WHERE slug=$1 AND active=true', [slug]); return q.rows[0]?.data || null }
 const csvRoot = process.env.CSV_PROBLEMS_DIR || '/data/csv-problems';
 const csvMetrics = { binary_probability: ['log_loss', 'accuracy', 'f1', 'precision', 'recall', 'balanced_accuracy'], multiclass_probability: ['log_loss', 'accuracy', 'macro_f1', 'macro_precision', 'macro_recall'], multilabel_probability: ['micro_f1', 'macro_f1', 'hamming_loss'], regression: ['rmse', 'mae', 'mse', 'r2', 'mape', 'smape'], ranking: ['ndcg_at_k', 'mrr', 'map', 'recall_at_k'], text_generation: ['sacrebleu', 'chrf'] };
@@ -135,6 +155,7 @@ function problemFields(body) {
 async function initialize() {
     await pool.query(`CREATE TABLE IF NOT EXISTS users(id UUID PRIMARY KEY,username VARCHAR(40) NOT NULL UNIQUE,email VARCHAR(255) NOT NULL UNIQUE,password_hash TEXT NOT NULL,created_at TIMESTAMPTZ NOT NULL DEFAULT now())`);
     await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS role VARCHAR(16) NOT NULL DEFAULT 'student'");
+    await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar TEXT");
     await pool.query(`CREATE TABLE IF NOT EXISTS problems(slug VARCHAR(80) PRIMARY KEY,data JSONB NOT NULL,active BOOLEAN NOT NULL DEFAULT TRUE,created_at TIMESTAMPTZ NOT NULL DEFAULT now(),updated_at TIMESTAMPTZ NOT NULL DEFAULT now())`);
     for (const p of seededProblems) { await pool.query('INSERT INTO problems(slug,data) VALUES($1,$2::jsonb) ON CONFLICT(slug) DO NOTHING', [p.slug, JSON.stringify(p)]) }
     const adminUsername = process.env.ADMIN_BOOTSTRAP_USERNAME; const adminPassword = process.env.ADMIN_BOOTSTRAP_PASSWORD;
@@ -155,17 +176,45 @@ app.post('/api/auth/register', asyncRoute(async (req, res) => {
     const hash = await bcrypt.hash(password, 12); const id = randomUUID();
     try { await pool.query('INSERT INTO users(id,username,email,password_hash) VALUES($1,$2,$3,$4)', [id, username, email.toLowerCase(), hash]); }
     catch (e) { if (e.code === '23505') return res.status(409).json({ error: 'Username or email already exists' }); throw e }
-    res.status(201).json({ token: tokenFor({ id, username, role: 'student' }), user: { id, username, email: email.toLowerCase(), role: 'student' } });
+    res.status(201).json({ token: tokenFor({ id, username, role: 'student' }), user: { id, username, email: email.toLowerCase(), role: 'student', avatar: null } });
 }));
 app.post('/api/auth/login', asyncRoute(async (req, res) => {
     const { username, password } = req.body || {};
     if (typeof username !== 'string' || typeof password !== 'string') return res.status(400).json({ error: 'Invalid credentials' });
     const q = await pool.query('SELECT * FROM users WHERE username=$1 OR email=$1 LIMIT 1', [username]); const u = q.rows[0];
     if (!u || !(await bcrypt.compare(password, u.password_hash))) return res.status(401).json({ error: 'Invalid credentials' });
-    res.json({ token: tokenFor(u), user: { id: u.id, username: u.username, email: u.email, role: u.role } });
+    res.json({ token: tokenFor(u), user: { id: u.id, username: u.username, email: u.email, role: u.role, avatar: u.avatar } });
 }));
-app.get('/api/auth/me', auth, asyncRoute(async (req, res) => { const q = await pool.query('SELECT id,username,email,role FROM users WHERE id=$1', [req.user.id]); res.json({ user: q.rows[0] }) }));
-app.get('/api/problems', asyncRoute(async (_req, res) => res.json({ problems: (await listProblems()).map(publicProblem) })));
+app.get('/api/auth/me', auth, asyncRoute(async (req, res) => res.json({ user: await profileFor(req.user.id) })));
+app.put('/api/auth/profile', auth, asyncRoute(async (req, res) => {
+    const username = String(req.body?.username || '').trim();
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    if (!/^[a-zA-Z0-9_]{3,40}$/.test(username) || !/^\S+@\S+\.\S+$/.test(email) || email.length > 255) {
+        return res.status(400).json({ error: 'Username must be 3–40 letters/numbers/_. Enter a valid email.' });
+    }
+    try { await pool.query('UPDATE users SET username=$1,email=$2 WHERE id=$3', [username, email, req.user.id]); }
+    catch (e) { if (e.code === '23505') return res.status(409).json({ error: 'Username or email already exists' }); throw e }
+    res.json({ user: await profileFor(req.user.id) });
+}));
+app.post('/api/auth/avatar', auth, avatarUpload.single('avatar'), asyncRoute(async (req, res) => {
+    const file = req.file;
+    const png = file?.mimetype === 'image/png' && file.buffer.subarray(0, 8).equals(Buffer.from([0x89,0x50,0x4e,0x47,0x0d,0x0a,0x1a,0x0a]));
+    const jpeg = file?.mimetype === 'image/jpeg' && file.buffer[0] === 0xff && file.buffer[1] === 0xd8 && file.buffer[2] === 0xff;
+    const webp = file?.mimetype === 'image/webp' && file.buffer.subarray(0, 4).toString() === 'RIFF' && file.buffer.subarray(8, 12).toString() === 'WEBP';
+    if (!file || (!png && !jpeg && !webp)) return res.status(400).json({ error: 'Upload a valid PNG, JPEG or WebP image' });
+    const avatar = `data:${file.mimetype};base64,${file.buffer.toString('base64')}`;
+    await pool.query('UPDATE users SET avatar=$1 WHERE id=$2', [avatar, req.user.id]);
+    res.json({ avatar });
+}));
+app.get('/api/users/:username/profile', asyncRoute(async (req, res) => {
+    const profile = await publicProfileFor(req.params.username);
+    if (!profile) return res.status(404).json({ error: 'Profile not found' });
+    res.json({ user: profile });
+}));
+app.get('/api/problems', asyncRoute(async (_req, res) => {
+    const rows = await listProblems();
+    res.json({ problems: rows.map(r => ({ ...publicProblem(r.data), submissions: r.submissions, participants: r.participants })) });
+}));
 app.get('/api/problems/:slug', asyncRoute(async (req, res) => { const p = await findProblem(req.params.slug); if (!p) return res.status(404).json({ error: 'Not found' }); res.json({ problem: publicProblem(p) }) }));
 // Public samples only: never expose hidden tests or private CSV ground truth.
 app.get('/api/problems/:slug/sample-input.txt', asyncRoute(async(req,res) => {
@@ -185,11 +234,27 @@ app.get('/api/problems/:slug/sample-submission.csv', asyncRoute(async(req,res) =
 }));
 app.get('/api/contests', (_req, res) => res.json({ contests: [] }));
 app.get('/api/leaderboard', asyncRoute(async (_req, res) => {
-    const q = await pool.query(`SELECT u.username, count(*) FILTER(WHERE s.status='accepted')::int AS accepted, count(s.id)::int AS attempts FROM users u LEFT JOIN submissions s ON u.id=s.user_id GROUP BY u.id ORDER BY accepted DESC, attempts ASC, u.username LIMIT 50`);
+    const q = await pool.query(`SELECT u.username,u.avatar,COUNT(DISTINCT s.problem_slug) FILTER(WHERE s.status='accepted')::int AS solved,COUNT(s.id)::int AS attempts
+        FROM users u LEFT JOIN submissions s ON u.id=s.user_id WHERE u.role<>'admin' GROUP BY u.id ORDER BY solved DESC,attempts ASC,u.username LIMIT 50`);
     res.json({ users: q.rows });
 }));
-app.get('/api/submissions', auth, asyncRoute(async (req, res) => { const q = await pool.query('SELECT id,problem_slug,kind,status,passed,total,score,metric,created_at FROM submissions WHERE user_id=$1 ORDER BY created_at DESC LIMIT 100', [req.user.id]); res.json({ submissions: q.rows }) }));
+app.get('/api/submissions', auth, asyncRoute(async (req, res) => {
+    const slug = typeof req.query.slug === 'string' ? req.query.slug : null;
+    const q = slug
+        ? await pool.query('SELECT id,problem_slug,kind,status,passed,total,score,metric,created_at FROM submissions WHERE user_id=$1 AND problem_slug=$2 ORDER BY created_at DESC LIMIT 100', [req.user.id, slug])
+        : await pool.query('SELECT id,problem_slug,kind,status,passed,total,score,metric,created_at FROM submissions WHERE user_id=$1 ORDER BY created_at DESC LIMIT 100', [req.user.id]);
+    res.json({ submissions: q.rows });
+}));
 app.get('/api/submissions/:id', auth, asyncRoute(async (req, res) => { const s = await getSubmission(req.params.id, req.user.id); if (!s) return res.status(404).json({ error: 'Not found' }); res.json({ submission: s }) }));
+app.get('/api/problems/:slug/solutions', asyncRoute(async (req, res) => {
+    const problem = await findProblem(req.params.slug);
+    if (!problem) return res.status(404).json({ error: 'Problem not found' });
+    const q = await pool.query(`SELECT s.id,s.kind,s.status,s.passed,s.total,s.score,s.metric,s.created_at,u.username,u.avatar
+        FROM submissions s JOIN users u ON u.id=s.user_id
+        WHERE s.problem_slug=$1 AND u.role<>'admin'
+        ORDER BY s.created_at DESC LIMIT 100`, [req.params.slug]);
+    res.json({ solutions: q.rows });
+}));
 app.post('/api/submissions/code', auth, rateLimit({ windowMs: 60000, limit: 12 }), asyncRoute(async (req, res) => {
     const { slug, code } = req.body || {}; const p = await findProblem(slug);
     if (!p || p.kind !== 'code' || typeof code !== 'string' || !code.trim() || code.length > 50000) return res.status(400).json({ error: 'Invalid code submission' });
@@ -283,5 +348,5 @@ app.delete('/api/admin/problems/:slug', auth, admin, asyncRoute(async (req, res)
     const q = await pool.query('UPDATE problems SET active=false,updated_at=now() WHERE slug=$1 RETURNING slug', [req.params.slug]);
     if (!q.rowCount) return res.status(404).json({ error: 'Not found' }); res.json({ ok: true });
 }));
-app.use((err, _req, res, _next) => { console.error(err); res.status(err.code === 'LIMIT_FILE_SIZE' ? 413 : 500).json({ error: err.code === 'LIMIT_FILE_SIZE' ? 'CSV too large' : 'Request failed' }) });
+app.use((err, _req, res, _next) => { console.error(err); res.status(err.code === 'LIMIT_FILE_SIZE' ? 413 : 500).json({ error: err.code === 'LIMIT_FILE_SIZE' ? 'Uploaded file is too large' : 'Request failed' }) });
 await initialize(); server.listen(Number(process.env.PORT || 4000), '0.0.0.0', () => console.log('Platform API listening'));

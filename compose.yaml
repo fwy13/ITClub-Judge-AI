@@ -43,12 +43,9 @@ services:
       USE_CGROUPS: 'true'
       RUST_LOG: info
     volumes:
-      - type: bind
-        source: /run/isolate
-        target: /run/isolate
-        read_only: false
-        bind:
-          create_host_path: false
+      # A named volume also works on Docker Desktop, where the Linux host path
+      # /run/isolate is not available for bind mounting.
+      - isolate-run:/run/isolate
     tmpfs:
       - /tmp:rw,nosuid,size=512m
       - /run:rw,nosuid,size=32m
@@ -81,6 +78,7 @@ services:
 volumes:
   dbdata:
   csvdata:
+  isolate-run:
 networks:
   app:
     internal: false
