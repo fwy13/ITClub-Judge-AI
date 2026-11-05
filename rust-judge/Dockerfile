@@ -20,7 +20,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git clone --depth 1 https://github.com/ioi/isolate.git /tmp/isolate && \
     make -C /tmp/isolate install && \
     test -f /usr/local/etc/isolate && \
-    (id isolate >/dev/null 2>&1 || useradd -r -M -s /usr/sbin/nologin isolate)
+    (id isolate >/dev/null 2>&1 || useradd -r -M -s /usr/sbin/nologin isolate) && \
+    sed -i 's#^cg_root = auto:.*#cg_root = /sys/fs/cgroup#' /usr/local/etc/isolate
 # Assign an unused subordinate ID range; isolate uses it for sandbox identity mapping.
 RUN set -eux; \
     sed -i '/^isolate:/d' /etc/subuid /etc/subgid; \
