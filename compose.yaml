@@ -42,6 +42,13 @@ services:
       PYTHON_BIN: /opt/venv/bin/python
       USE_CGROUPS: 'true'
       RUST_LOG: info
+    volumes:
+      - type: bind
+        source: /run/isolate
+        target: /run/isolate
+        read_only: false
+        bind:
+          create_host_path: false
     tmpfs:
       - /tmp:rw,nosuid,size=512m
       - /run:rw,nosuid,size=32m
