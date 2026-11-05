@@ -1228,3 +1228,29 @@ footer b {
         align-items: flex-start
     }
 }
+
+/* Monaco, Markdown statements, and readable test authoring */
+.monaco-code {background:#1e1e1e;min-height:430px;overflow:hidden;border-radius:0 0 8px 8px}
+.admin-monaco {border-radius:8px;overflow:hidden;border:1px solid #cbdde8;margin-top:8px}
+.markdown-content {overflow-wrap:anywhere;line-height:1.75}
+.markdown-content pre {background:#f0f5fa;padding:15px;overflow-x:auto;border-radius:9px}
+.markdown-content code {background:#eef4f8;border-radius:4px;padding:2px 5px}
+.markdown-content pre code {background:transparent;padding:0}
+.markdown-content table {width:100%;border-collapse:collapse;margin:15px 0}
+.markdown-content th,.markdown-content td {padding:9px;border:1px solid #d9e4ed;text-align:left}
+.markdown-content img {max-width:100%;height:auto}
+.sample-io strong {display:block;margin:13px 0 7px;color:#023263}
+.sample-io pre {white-space:pre-wrap;overflow-wrap:anywhere;background:#f1f7fb;padding:14px;border-radius:8px;font:13px/1.7 monospace}
+.sample-io .btn {margin-top:12px}
+.admin-test-header {margin:14px 0;color:#023263}.admin-test-header small {display:block;color:#678099}
+.admin-test {background:#f8fbfe;border:1px solid #dceaf2;padding:14px;border-radius:9px;margin-bottom:13px}
+.admin-test-title {display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
+.admin-test textarea {font:13px/1.6 monospace!important}
+.bulk-import {margin-bottom:18px}.bulk-import-body {display:flex;align-items:center;flex-wrap:wrap;gap:12px;padding:18px}
+.bulk-import-body p {width:100%;margin:0;color:#60758b}
+.bulk-import-body input {flex:1;min-width:175px;max-width:320px}
+/* Original-site inspired animated cyan / navy gradient on Home navigation */
+.nav>a.home-nav-link {background:linear-gradient(115deg,#023263 0%,#147da6 45%,#50f8f7 85%,#023263 100%);background-size:260% 260%;color:#fff;box-shadow:0 3px 12px #02326324;animation:home-gradient 9s ease-in-out infinite}
+.nav>a.home-nav-link:hover,.nav>a.home-nav-link.active {color:#fff;filter:brightness(1.07)}
+@keyframes home-gradient {0%,100%{background-position:0% 50%}50%{background-position:100% 50%}}
+@media (prefers-reduced-motion:reduce){.nav>a.home-nav-link{animation:none}}

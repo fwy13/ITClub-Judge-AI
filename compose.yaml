@@ -25,7 +25,7 @@ services:
       ADMIN_BOOTSTRAP_USERNAME: ${ADMIN_BOOTSTRAP_USERNAME:-}
       ADMIN_BOOTSTRAP_PASSWORD: ${ADMIN_BOOTSTRAP_PASSWORD:-}
       CSV_PROBLEMS_DIR: /data/csv-problems
-    volumes: [csvdata:/data/csv-problems]
+    volumes: [csvdata:/data/csv-problems, ./csv-judge/problems:/csv-bundled-problems:ro]
     depends_on:
       db: {condition: service_healthy}
       csv-volume-init: {condition: service_completed_successfully}

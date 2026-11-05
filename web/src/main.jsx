@@ -30,6 +30,9 @@ import {
   FileSpreadsheet,
   Activity,
 } from "lucide-react";
+import MonacoEditor from "@monaco-editor/react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import "./style.css";
 const API = "/api";
 async function request(path, options = {}) {
@@ -79,7 +82,7 @@ function App() {
             className={drawer ? "nav open" : "nav"}
             onClick={() => setDrawer(false)}
           >
-            <Link to="/">
+            <Link to="/" className={route === "/" ? "home-nav-link active" : "home-nav-link"}>
               <House size={16} /> Home
             </Link>
             <Link to="/problems">
@@ -569,7 +572,7 @@ function ProblemPage({ slug, user }) {
             <Layers3 size={19} /> Problem description
           </div>
           <div className="panel-body">
-            <p>{problem.description}</p>
+            <div className="markdown-content"><ReactMarkdown remarkPlugins={[remarkGfm]}>{problem.description}</ReactMarkdown></div>
             {problem.kind === "code" ? (
               <>
                 <h3>Submission format</h3>
@@ -578,9 +581,13 @@ function ProblemPage({ slug, user }) {
                   evaluates your code against private test cases.
                 </p>
                 <h3>Sample test case</h3>
-                <pre className="sample">
-                  {JSON.stringify(problem.sample_tests[0] || {}, null, 2)}
-                </pre>
+                <div className="sample-io">
+                  <strong>Input</strong>
+                  <pre>{(problem.sample_tests[0]?.args || []).map(plainValue).join("\n") || "(no arguments)"}</pre>
+                  <strong>Expected output</strong>
+                  <pre>{plainValue(problem.sample_tests[0]?.expected)}</pre>
+                  <a className="btn ghost small" href={`/api/problems/${encodeURIComponent(slug)}/sample-input.txt`} download>Download sample input (.txt)</a>
+                </div>
               </>
             ) : (
               <>
@@ -592,7 +599,7 @@ function ProblemPage({ slug, user }) {
                 <p>
                   Scoring metric: <b>{problem.metric}</b>
                 </p>
-                <Link to="/problems">View other CSV challenges</Link>
+                <a className="btn ghost small" href={`/api/problems/${encodeURIComponent(slug)}/sample-submission.csv`} download>Download sample CSV</a>
               </>
             )}
           </div>
@@ -606,13 +613,7 @@ function ProblemPage({ slug, user }) {
             </span>
           </div>
           {problem.kind === "code" ? (
-            <textarea
-              className="code-editor"
-              spellCheck={false}
-              value={code}
-              onChange={(e) => setCode(e.target.value)}
-              aria-label="Python source code"
-            />
+            <div className="monaco-code"><MonacoEditor height="430px" language="python" theme="vs-dark" value={code} onChange={value => setCode(value ?? "")} options={{minimap:{enabled:false},fontSize:14,automaticLayout:true,scrollBeyondLastLine:false,tabSize:4,wordWrap:"on"}} /></div>
           ) : (
             <div className="upload-area">
               <Upload size={40} />
@@ -946,6 +947,10 @@ const defaultCsvConfig = {
   greater_is_better: false,
   allow_extra_columns: false,
 };
+// Editable text cases are serialized to the original structured worker protocol.
+const plainValue = v => typeof v === 'string' ? v : JSON.stringify(v ?? null);
+const displayTests = tests => (tests || []).map(t => ({input:(t.args || []).map(plainValue).join("\n"),output:plainValue(t.expected)}));
+const initialTests = [{input:"2", output:"4"}];
 const emptyAdmin = {
   slug: "",
   title: "",
@@ -953,10 +958,10 @@ const emptyAdmin = {
   difficulty: "Easy",
   kind: "code",
   description: "",
-  starter: "def solve(x):\n    return x",
+  starter: "def solve(x):\n    pass",
   function: "solve",
   class_name: "",
-  tests: JSON.stringify([{ args: [2], expected: 4 }], null, 2),
+  tests: initialTests,
   config: JSON.stringify(defaultCsvConfig, null, 2),
 };
 function AdminProblems({ user }) {
@@ -965,6 +970,8 @@ function AdminProblems({ user }) {
     [model, setModel] = useState(emptyAdmin),
     [truth, setTruth] = useState(null),
     [sample, setSample] = useState(null),
+    [importFile, setImportFile] = useState(null),
+    [importing, setImporting] = useState(false),
     [busy, setBusy] = useState(false),
     [error, setError] = useState(""),
     [success, setSuccess] = useState("");
@@ -985,20 +992,42 @@ function AdminProblems({ user }) {
       problem
         ? {
             ...problem,
-            tests: JSON.stringify(problem.tests || [], null, 2),
+            tests: displayTests(problem.tests),
             config: JSON.stringify(problem.config || defaultCsvConfig, null, 2),
           }
         : emptyAdmin,
     );
   };
   const change = (key, value) => setModel((m) => ({ ...m, [key]: value }));
+  const updateTest = (index, key, value) => setModel(m => ({ ...m, tests: m.tests.map((t,i) => i===index ? {...t,[key]:value} : t) }));
+  const uploadBatch = async () => {
+    if (!importFile) return;
+    setError(""); setSuccess(""); setImporting(true);
+    try {
+      const body=new FormData(); body.set("file",importFile);
+      const result=await request("/admin/problems/import-csv",{method:"POST",body});
+      setSuccess(`Imported ${result.imported} exercises (${result.tests} test cases).`);
+      setImportFile(null); await load();
+    } catch (e) { setError(e.message) }
+    finally { setImporting(false) }
+  };
+  const downloadTemplate = async () => {
+    try {
+      const token=localStorage.getItem("token");
+      const response=await fetch("/api/admin/problems/import-template.csv",{headers:{Authorization:`Bearer ${token}`}});
+      if(!response.ok) throw Error("Template download failed");
+      const blob=await response.blob(); const url=URL.createObjectURL(blob);
+      const a=document.createElement("a"); a.href=url; a.download="python-problems-template.csv"; a.click();
+      setTimeout(()=>URL.revokeObjectURL(url),1000);
+    } catch(e) { setError(e.message) }
+  };
   const save = async (e) => {
     e.preventDefault();
     setBusy(true);
     setError("");
     setSuccess("");
     try {
-      if (model.kind === "code") JSON.parse(model.tests);
+      if (model.kind === "code" && (!model.tests.length || model.tests.some(t => !t.output.trim()))) throw Error("Add a test case with expected output");
       if (model.kind === "csv") JSON.parse(model.config);
       const body = new FormData();
       for (const key of [
@@ -1011,10 +1040,10 @@ function AdminProblems({ user }) {
         "starter",
         "function",
         "class_name",
-        "tests",
         "config",
       ])
         body.set(key, model[key] || "");
+      if (model.kind === "code") body.set("tests", JSON.stringify(model.tests));
       if (truth) body.set("ground_truth", truth);
       if (sample) body.set("sample_submission", sample);
       await request(
@@ -1083,6 +1112,15 @@ function AdminProblems({ user }) {
       </div>
       {error && <p className="error-msg">{error}</p>}
       {success && <p className="admin-success">{success}</p>}
+      <section className="panel bulk-import">
+        <div className="panel-head"><Upload size={18}/> Bulk import Python exercises (CSV)</div>
+        <div className="bulk-import-body">
+          <p>Import many exercises at once. Repeat the slug in multiple rows to add test cases.</p>
+          <button type="button" className="btn ghost small" onClick={downloadTemplate}>Download CSV template</button>
+          <input aria-label="Python problems CSV" type="file" accept=".csv,text/csv" onChange={e => setImportFile(e.target.files?.[0] || null)}/>
+          <button type="button" className="btn primary small" disabled={!importFile || importing} onClick={uploadBatch}>{importing ? "Importing..." : "Import exercises"}</button>
+        </div>
+      </section>
       <div className="admin-layout">
         <section className="panel">
           <div className="panel-head">
@@ -1186,13 +1224,13 @@ function AdminProblems({ user }) {
               </select>
             </label>
             <label>
-              Description
+              Description (Markdown .md)
               <textarea
                 required
                 rows="5"
                 value={model.description}
                 onChange={(e) => change("description", e.target.value)}
-                placeholder="Explain the problem statement and expected output."
+                placeholder="## Problem\nExplain the task, constraints and examples using Markdown."
               />
             </label>
             {model.kind === "code" ? (
@@ -1217,28 +1255,16 @@ function AdminProblems({ user }) {
                   </label>
                 </div>
                 <label>
-                  Starter code
-                  <textarea
-                    className="admin-code"
-                    rows="7"
-                    value={model.starter || ""}
-                    onChange={(e) => change("starter", e.target.value)}
-                  />
+                  Starter signature (students see only this signature)
+                  <div className="admin-monaco"><MonacoEditor height="230px" language="python" theme="vs-dark" value={model.starter || ""} onChange={value => change("starter",value ?? "")} options={{minimap:{enabled:false},fontSize:13,automaticLayout:true,scrollBeyondLastLine:false}} /></div>
+                  <small>The public API strips implementation bodies and exposes only the callable signature with pass.</small>
                 </label>
-                <label>
-                  Test cases (JSON array)
-                  <textarea
-                    className="admin-code"
-                    rows="10"
-                    required
-                    value={model.tests || ""}
-                    onChange={(e) => change("tests", e.target.value)}
-                  />
-                  <small>
-                    Each test: {`{"args":[1,2],"expected":3}`}. The first test
-                    is shown publicly; all others stay private.
-                  </small>
-                </label>
+                <div className="admin-test-header"><h3>Input / output test cases</h3><small>One positional argument per nonempty input line; the first case is the public sample.</small></div>
+                {model.tests.map((test,index) => <div className="admin-test" key={index}>
+                  <div className="admin-test-title"><b>Test {index+1} {index===0?"(sample)":"(hidden)"}</b><button type="button" className="btn ghost small" disabled={model.tests.length===1} onClick={() => change("tests", model.tests.filter((_,i)=>i!==index))}>Remove</button></div>
+                  <div className="admin-two"><label>Input (one argument per line)<textarea rows="5" spellCheck={false} value={test.input} onChange={e => updateTest(index,"input",e.target.value)} placeholder={'[2, 7, 11, 15]\n9'}/></label><label>Expected output<textarea required rows="5" spellCheck={false} value={test.output} onChange={e => updateTest(index,"output",e.target.value)} placeholder="[0, 1]"/></label></div>
+                </div>)}
+                <button type="button" className="btn ghost small" onClick={() => change("tests",[...model.tests,{input:"",output:""}])}>+ Add test case</button>
               </>
             ) : (
               <>

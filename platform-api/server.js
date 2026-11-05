@@ -11,6 +11,7 @@ import http from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { readFile, mkdir, writeFile, rename, rm } from 'node:fs/promises';
 import path from 'node:path';
+import {parse as parseCsv} from 'csv-parse/sync';
 
 const { Pool } = pg;
 const pool = new Pool({ connectionString: process.env.DATABASE_URL, max: 10 });
@@ -25,7 +26,19 @@ const sockets = new Map();
 const queue = []; let active = 0; const MAX_ACTIVE = 2; const MAX_QUEUE = 200;
 const workerUrl = process.env.RUST_WORKER_URL || 'http://rust-worker:3001';
 const csvUrl = process.env.CSV_JUDGE_URL || 'http://csv-judge:8100';
-const publicProblem = p => ({ slug: p.slug, title: p.title, category: p.category, difficulty: p.difficulty, kind: p.kind, description: p.description, starter: p.starter, metric: p.metric, sample_tests: p.tests.slice(0, 1).map(t => ({ args: t.args, expected: t.expected })) });
+// Only send the callable signature; never expose a stored reference implementation.
+// Leave `pass` as a placeholder so the code remains a valid Python submission.
+function publicSignature(p) {
+    if (p.kind !== 'code') return '';
+    const source = String(p.starter || '');
+    const escaped = String(p.function || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const pattern = new RegExp('^\\s*(?:async\\s+)?def\\s+' + escaped + '\\s*\\([^\\n]*\\)\\s*(?:->[^:\\n]+)?\\s*:', 'm');
+    const match = source.match(pattern);
+    const declaration = match ? match[0].trim() : `def ${p.function || 'solve'}(*args, **kwargs):`;
+    if (p.class_name) return `class ${p.class_name}:\n    ${declaration}\n        pass`;
+    return `${declaration}\n    pass`;
+}
+const publicProblem = p => ({ slug: p.slug, title: p.title, category: p.category, difficulty: p.difficulty, kind: p.kind, description: p.description, starter: publicSignature(p), metric: p.metric, sample_tests: p.tests.slice(0, 1).map(t => ({ args: t.args, expected: t.expected })) });
 const asyncRoute = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 const tokenFor = user => jwt.sign({ id: user.id, username: user.username, role: user.role || 'student' }, secret, { expiresIn: '12h', issuer: 'itclub-judge' });
 const verify = token => jwt.verify(token, secret, { issuer: 'itclub-judge' });
@@ -87,13 +100,25 @@ const csvMetrics = { binary_probability: ['log_loss', 'accuracy', 'f1', 'precisi
 const validateSlug = s => typeof s === 'string' && /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(s) && s.length <= 80;
 const validText = (s, max = 10000) => typeof s === 'string' && s.trim().length > 0 && s.length <= max;
 function parseJson(v) { if (typeof v === 'object' && v !== null) return v; try { return JSON.parse(v || '') } catch { return null } }
+// Each nonempty line is a positional argument. JSON literals are accepted for
+// structured values; other text is interpreted as an ordinary string.
+function parsePlainValue(value) {
+    const text = String(value ?? '').trim();
+    if (!text) return '';
+    try { return JSON.parse(text) } catch { return text }
+}
+function testFromText(input, output) {
+    if (typeof input !== 'string' || typeof output !== 'string' || !output.trim()) throw Error('Test input and expected output must be text');
+    if (input.length > 12000 || output.length > 12000) throw Error('Input/output text too long');
+    return {args: input.replace(/\r\n/g, '\n').split('\n').filter(line => line.trim()).map(parsePlainValue), expected: parsePlainValue(output)};
+}
 function problemFields(body) {
     const slug = String(body.slug || ''), title = String(body.title || ''), description = String(body.description || ''), kind = body.kind;
     if (!validateSlug(slug) || !validText(title, 160) || !validText(description, 12000) || !['code', 'csv'].includes(kind)) throw Error('Invalid slug, title, description or type');
     const difficulty = ['Easy', 'Medium', 'Hard'].includes(body.difficulty) ? body.difficulty : 'Medium';
     const base = { slug, title, description, kind, difficulty, category: String(body.category || 'General').slice(0, 80) };
     if (kind === 'code') {
-        const tests = parseJson(body.tests); if (!Array.isArray(tests) || tests.length < 1 || tests.length > 100 || !tests.every(t => t && Array.isArray(t.args) && Object.hasOwn(t, 'expected'))) throw Error('Tests must be an array (1–100) of {args, expected}');
+        const rawTests = parseJson(body.tests); const tests = Array.isArray(rawTests) ? rawTests.map(t => t && typeof t.input === 'string' ? testFromText(t.input, t.output) : t) : null; if (!Array.isArray(tests) || tests.length < 1 || tests.length > 100 || !tests.every(t => t && Array.isArray(t.args) && Object.hasOwn(t, 'expected'))) throw Error('Tests must be an array (1–100) of {args, expected}');
         if (JSON.stringify(tests).length > 100000) throw Error('Test cases exceed 100 KB');
         if (!validText(body.function, 100) || !/^[a-zA-Z_][a-zA-Z_0-9]*$/.test(body.function)) throw Error('Invalid function name');
         if (body.class_name && !/^[a-zA-Z_][a-zA-Z_0-9]*$/.test(body.class_name)) throw Error('Invalid class name');
@@ -142,6 +167,22 @@ app.post('/api/auth/login', asyncRoute(async (req, res) => {
 app.get('/api/auth/me', auth, asyncRoute(async (req, res) => { const q = await pool.query('SELECT id,username,email,role FROM users WHERE id=$1', [req.user.id]); res.json({ user: q.rows[0] }) }));
 app.get('/api/problems', asyncRoute(async (_req, res) => res.json({ problems: (await listProblems()).map(publicProblem) })));
 app.get('/api/problems/:slug', asyncRoute(async (req, res) => { const p = await findProblem(req.params.slug); if (!p) return res.status(404).json({ error: 'Not found' }); res.json({ problem: publicProblem(p) }) }));
+// Public samples only: never expose hidden tests or private CSV ground truth.
+app.get('/api/problems/:slug/sample-input.txt', asyncRoute(async(req,res) => {
+    const p = await findProblem(req.params.slug);
+    if (!p || p.kind !== 'code' || !p.tests?.length) return res.status(404).json({error:'Sample not found'});
+    const sample = p.tests[0];
+    res.type('text/plain').attachment(`${p.slug}-sample-input.txt`).send(sample.args.map(v => typeof v === 'string' ? v : JSON.stringify(v)).join('\n')+'\n');
+}));
+app.get('/api/problems/:slug/sample-submission.csv', asyncRoute(async(req,res) => {
+    const p = await findProblem(req.params.slug);
+    if (!p || p.kind !== 'csv') return res.status(404).json({error:'Sample not found'});
+    for (const base of [csvRoot, '/csv-bundled-problems']) {
+        try { const contents = await readFile(path.join(base,p.slug,'sample_submission.csv')); return res.type('text/csv').attachment(`${p.slug}-sample-submission.csv`).send(contents) }
+        catch (e) { if (e.code !== 'ENOENT') throw e }
+    }
+    res.status(404).json({error:'Sample not found'});
+}));
 app.get('/api/contests', (_req, res) => res.json({ contests: [] }));
 app.get('/api/leaderboard', asyncRoute(async (_req, res) => {
     const q = await pool.query(`SELECT u.username, count(*) FILTER(WHERE s.status='accepted')::int AS accepted, count(s.id)::int AS attempts FROM users u LEFT JOIN submissions s ON u.id=s.user_id GROUP BY u.id ORDER BY accepted DESC, attempts ASC, u.username LIMIT 50`);
@@ -166,6 +207,43 @@ app.post('/api/submissions/csv', auth, rateLimit({ windowMs: 60000, limit: 12 })
 }));
 // Administrator management. The role is always checked against the DB, not only the JWT.
 const adminUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024, files: 2, fields: 30 } });
+const importUpload = multer({storage: multer.memoryStorage(), limits:{fileSize:2*1024*1024,files:1}});
+app.get('/api/admin/problems/import-template.csv', auth, admin, (_req,res) => {
+    const template = 'slug,title,category,difficulty,description,function,class_name,starter,input,output\n' +
+      'add-two,Add Two Numbers,Python,Easy,Return the sum of two integers.,add,,"def add(a, b):\n    pass","2\n5",7\n';
+    res.type('text/csv').attachment('python-problems-template.csv').send(template);
+});
+app.post('/api/admin/problems/import-csv', auth, admin, rateLimit({windowMs:60000,limit:5}), importUpload.single('file'), asyncRoute(async(req,res) => {
+    if (!req.file?.originalname?.toLowerCase().endsWith('.csv')) return res.status(400).json({error:'Upload a CSV file'});
+    let rows;
+    try { rows = parseCsv(req.file.buffer.toString('utf8'), {columns:true,skip_empty_lines:true,bom:true}); }
+    catch(e) { return res.status(400).json({error:'Invalid CSV: '+e.message}); }
+    if (!rows.length || rows.length>1000) return res.status(400).json({error:'Expected 1-1000 rows'});
+    const required=['slug','title','description','function','input','output'];
+    if(required.some(k=>!Object.hasOwn(rows[0],k))) return res.status(400).json({error:`Required headers: ${required.join(', ')}`});
+    const groups=new Map();
+    try {
+        for(const row of rows) {
+            const slug=(row.slug||'').trim();
+            if(!groups.has(slug)) groups.set(slug,{...row,slug,tests:[]});
+            const group=groups.get(slug);
+            for(const k of ['title','description','function','class_name','starter','category','difficulty']) {
+                if ((group[k]||'') !== (row[k]||'')) throw Error(`Conflicting ${k} for ${slug}`);
+            }
+            group.tests.push(testFromText(row.input,row.output));
+        }
+        if(groups.size>100) throw Error('Maximum 100 problems per import');
+        const problems=[...groups.values()].map(row=>problemFields({...row,kind:'code',tests:JSON.stringify(row.tests)}));
+        const client=await pool.connect();
+        try {
+            await client.query('BEGIN');
+            for(const problem of problems) await client.query('INSERT INTO problems(slug,data) VALUES($1,$2::jsonb)',[problem.slug,JSON.stringify(problem)]);
+            await client.query('COMMIT');
+        } catch(e) { await client.query('ROLLBACK'); if(e.code==='23505') throw Error('A slug already exists; import canceled'); throw e }
+        finally { client.release(); }
+        res.status(201).json({imported:problems.length,tests:rows.length});
+    }catch(e) { res.status(400).json({error:String(e.message).slice(0,240)}); }
+}));
 app.get('/api/admin/problems', auth, admin, asyncRoute(async (_req, res) => {
     const rows = await pool.query('SELECT slug,active,data,created_at,updated_at FROM problems ORDER BY created_at DESC');
     res.json({ problems: rows.rows.map(r => ({ ...r.data, active: r.active, created_at: r.created_at, updated_at: r.updated_at })) });
