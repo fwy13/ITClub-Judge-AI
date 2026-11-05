@@ -1,0 +1,6 @@
+query_id,item_id,relevance
+q001,d001,2
+q001,d002,0
+q001,d003,1
+q002,d004,0
+q002,d005,1

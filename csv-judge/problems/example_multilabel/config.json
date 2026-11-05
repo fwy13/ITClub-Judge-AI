@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "id_column": "id",
+  "target_column": "unused",
+  "target_columns": ["true_sports", "true_science", "true_art"],
+  "prediction_columns": ["sports", "science", "art"],
+  "task_type": "multilabel_probability",
+  "metric": "micro_f1",
+  "greater_is_better": true,
+  "binary_threshold": 0.5,
+  "max_file_size_mb": 20,
+  "max_rows": 100000,
+  "allow_extra_columns": false
+}

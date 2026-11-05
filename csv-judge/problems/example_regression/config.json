@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "id_column": "id",
+  "target_column": "target",
+  "prediction_columns": ["prediction"],
+  "task_type": "regression",
+  "metric": "rmse",
+  "greater_is_better": false,
+  "max_file_size_mb": 20,
+  "max_rows": 100000,
+  "allow_extra_columns": false
+}

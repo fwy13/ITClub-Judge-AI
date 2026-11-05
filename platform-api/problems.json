@@ -1,0 +1,224 @@
+[
+  {
+    "slug": "two-sum",
+    "title": "Two Sum",
+    "category": "Python",
+    "difficulty": "Easy",
+    "kind": "code",
+    "description": "Return indices of two numbers whose sum equals the target. Implement Solution.twoSum(nums, target).",
+    "starter": "class Solution:\n    def twoSum(self, nums, target):\n        # Your solution\n        pass",
+    "function": "twoSum",
+    "class_name": "Solution",
+    "tests": [
+      {
+        "args": [
+          [
+            2,
+            7,
+            11,
+            15
+          ],
+          9
+        ],
+        "expected": [
+          0,
+          1
+        ]
+      },
+      {
+        "args": [
+          [
+            3,
+            2,
+            4
+          ],
+          6
+        ],
+        "expected": [
+          1,
+          2
+        ]
+      },
+      {
+        "args": [
+          [
+            3,
+            3
+          ],
+          6
+        ],
+        "expected": [
+          0,
+          1
+        ]
+      }
+    ]
+  },
+  {
+    "slug": "vector-add",
+    "title": "Vector Addition with NumPy",
+    "category": "AI / NumPy",
+    "difficulty": "Easy",
+    "kind": "code",
+    "description": "Implement add_vectors(a,b) using NumPy, returning the element-wise sum.",
+    "starter": "import numpy as np\n\ndef add_vectors(a, b):\n    return np.add(a, b)",
+    "function": "add_vectors",
+    "class_name": null,
+    "tests": [
+      {
+        "args": [
+          [
+            1,
+            2,
+            3
+          ],
+          [
+            4,
+            5,
+            6
+          ]
+        ],
+        "expected": [
+          5,
+          7,
+          9
+        ]
+      },
+      {
+        "args": [
+          [
+            -1,
+            5
+          ],
+          [
+            1,
+            -2
+          ]
+        ],
+        "expected": [
+          0,
+          3
+        ]
+      }
+    ]
+  },
+  {
+    "slug": "relu",
+    "title": "ReLU with PyTorch",
+    "category": "AI / PyTorch",
+    "difficulty": "Medium",
+    "kind": "code",
+    "description": "Implement relu(values) with torch and return the nonnegative result.",
+    "starter": "import torch\n\ndef relu(values):\n    x = torch.tensor(values)\n    return torch.relu(x)",
+    "function": "relu",
+    "class_name": null,
+    "tests": [
+      {
+        "args": [
+          [
+            -2,
+            0,
+            3
+          ]
+        ],
+        "expected": [
+          0,
+          0,
+          3
+        ]
+      },
+      {
+        "args": [
+          [
+            5,
+            -1,
+            2
+          ]
+        ],
+        "expected": [
+          5,
+          0,
+          2
+        ]
+      }
+    ]
+  },
+  {
+    "slug": "example_binary",
+    "title": "Binary Classification",
+    "category": "AI / CSV",
+    "difficulty": "Medium",
+    "kind": "csv",
+    "description": "Predict binary outcomes. Upload id,prediction as CSV.",
+    "starter": "",
+    "function": null,
+    "class_name": null,
+    "tests": [],
+    "metric": "log_loss"
+  },
+  {
+    "slug": "example_multiclass",
+    "title": "Multiclass Classification",
+    "category": "AI / CSV",
+    "difficulty": "Medium",
+    "kind": "csv",
+    "description": "Upload class probabilities for each ID.",
+    "starter": "",
+    "function": null,
+    "class_name": null,
+    "tests": [],
+    "metric": "log_loss"
+  },
+  {
+    "slug": "example_regression",
+    "title": "Regression",
+    "category": "AI / CSV",
+    "difficulty": "Medium",
+    "kind": "csv",
+    "description": "Upload predictions to minimize RMSE.",
+    "starter": "",
+    "function": null,
+    "class_name": null,
+    "tests": [],
+    "metric": "rmse"
+  },
+  {
+    "slug": "example_multilabel",
+    "title": "Multilabel Prediction",
+    "category": "AI / CSV",
+    "difficulty": "Medium",
+    "kind": "csv",
+    "description": "Upload multilabel probabilities.",
+    "starter": "",
+    "function": null,
+    "class_name": null,
+    "tests": [],
+    "metric": "micro_f1"
+  },
+  {
+    "slug": "example_ranking",
+    "title": "Learning to Rank",
+    "category": "AI / CSV",
+    "difficulty": "Medium",
+    "kind": "csv",
+    "description": "Upload ranked item scores.",
+    "starter": "",
+    "function": null,
+    "class_name": null,
+    "tests": [],
+    "metric": "ndcg_at_k"
+  },
+  {
+    "slug": "example_text",
+    "title": "Text Generation",
+    "category": "AI / CSV",
+    "difficulty": "Medium",
+    "kind": "csv",
+    "description": "Upload text predictions for BLEU scoring.",
+    "starter": "",
+    "function": null,
+    "class_name": null,
+    "tests": [],
+    "metric": "sacrebleu"
+  }
+]

@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "id_column": "id",
+  "target_column": "label",
+  "prediction_columns": ["cat", "dog", "bird"],
+  "task_type": "multiclass_probability",
+  "metric": "log_loss",
+  "greater_is_better": false,
+  "max_file_size_mb": 20,
+  "max_rows": 100000,
+  "allow_extra_columns": false,
+  "probability_tolerance": 0.000001
+}

@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "id_column": "query_id",
+  "item_column": "item_id",
+  "target_column": "relevance",
+  "prediction_columns": ["score"],
+  "task_type": "ranking",
+  "metric": "ndcg_at_k",
+  "greater_is_better": true,
+  "max_file_size_mb": 20,
+  "max_rows": 100000,
+  "allow_extra_columns": false,
+  "metric_options": {
+    "k": 3
+  }
+}

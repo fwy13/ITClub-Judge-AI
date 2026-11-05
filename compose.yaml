@@ -1,0 +1,79 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: judge
+      POSTGRES_USER: judge
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes: [dbdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U judge -d judge"]
+      interval: 5s
+      retries: 15
+    restart: unless-stopped
+    networks: [app]
+  auth-api:
+    build: ./platform-api
+    environment:
+      PORT: '4000'
+      DATABASE_URL: postgres://judge:${POSTGRES_PASSWORD}@db:5432/judge
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in .env}
+      RUST_WORKER_URL: http://rust-worker:3001
+      CSV_JUDGE_URL: http://csv-judge:8100
+      CSV_INTERNAL_KEY: ${CSV_INTERNAL_KEY:?Set CSV_INTERNAL_KEY}
+      FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://localhost:8080}
+      ADMIN_BOOTSTRAP_USERNAME: ${ADMIN_BOOTSTRAP_USERNAME:-}
+      ADMIN_BOOTSTRAP_PASSWORD: ${ADMIN_BOOTSTRAP_PASSWORD:-}
+      CSV_PROBLEMS_DIR: /data/csv-problems
+    volumes: [csvdata:/data/csv-problems]
+    depends_on:
+      db: {condition: service_healthy}
+      csv-volume-init: {condition: service_completed_successfully}
+    networks: [app]
+    restart: unless-stopped
+  rust-worker:
+    build:
+      context: ./rust-judge
+      target: worker
+    privileged: true # isolate requires Linux namespaces/cgroups; deploy on dedicated isolated Linux host
+    environment:
+      WORKER_BIND: 0.0.0.0:3001
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-2}
+      PYTHON_BIN: /opt/venv/bin/python
+      USE_CGROUPS: 'true'
+      RUST_LOG: info
+    tmpfs:
+      - /tmp:rw,nosuid,size=512m
+      - /run:rw,nosuid,size=32m
+    cgroup: host
+    networks: [app]
+    # For stronger isolation deploy worker on a dedicated Linux VM.
+    restart: unless-stopped
+  csv-volume-init:
+    image: alpine:3.20
+    user: root
+    command: ['sh','-c','mkdir -p /data/csv-problems && chown -R 1000:1000 /data/csv-problems']
+    volumes: [csvdata:/data/csv-problems]
+    networks: [app]
+  csv-judge:
+    build: ./csv-judge
+    environment:
+      CSV_INTERNAL_KEY: ${CSV_INTERNAL_KEY}
+      CSV_DYNAMIC_PROBLEMS: /data/csv-problems
+    volumes: [csvdata:/data/csv-problems:ro]
+    read_only: true
+    tmpfs: [/tmp]
+    networks: [app]
+    restart: unless-stopped
+  web:
+    build: ./web
+    ports: ['${WEB_BIND:-127.0.0.1}:8080:80']
+    depends_on: [auth-api]
+    networks: [app]
+    restart: unless-stopped
+volumes:
+  dbdata:
+  csvdata:
+networks:
+  app:
+    internal: false
