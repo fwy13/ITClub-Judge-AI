@@ -875,44 +875,59 @@ function Submissions({ user }) {
 }
 function Ranklist() {
   const [users, setUsers] = useState([]);
+  const [error, setError] = useState("");
   useEffect(() => {
     request("/leaderboard")
-      .then((d) => setUsers(d.users))
-      .catch(() => {});
+      .then((data) => setUsers(data.users || []))
+      .catch((err) => setError(err.message));
   }, []);
+  // The API determines rank and tie-breaks; only change the visual presentation.
+  const podiumOrder = [1, 0, 2].filter((index) => index < users.length);
+  const medals = ["🥇", "🥈", "🥉"];
+  const places = ["1st place", "2nd place", "3rd place"];
   return (
-    <div className="shell page">
+    <div className="shell page ranklist-page">
       <div className="page-heading">
         <span className="section-kicker">COMMUNITY</span>
         <h1>Ranklist</h1>
         <p>Members ranked by accepted solutions.</p>
       </div>
+      {error && <p className="error-msg" role="alert">{error}</p>}
+      {users.length > 0 && (
+        <section className="rank-podium" aria-label="Top three on the leaderboard">
+          {podiumOrder.map((index) => {
+            const user = users[index];
+            return (
+              <article key={user.username} className={`rank-podium-card rank-position-${index + 1}`}>
+                <div className="rank-medal" aria-hidden="true">{medals[index]}</div>
+                <div className="rank-avatar" aria-hidden="true">
+                  {(user.username || "?").slice(0, 2).toUpperCase()}
+                </div>
+                <div className="rank-place">{places[index]}</div>
+                <strong className="rank-name">{user.username}</strong>
+                <div className="rank-score"><b>{user.accepted}</b><span>accepted</span></div>
+                <div className="rank-attempts">{user.attempts} attempts</div>
+                <div className="rank-stand" aria-hidden="true">{index + 1}</div>
+              </article>
+            );
+          })}
+        </section>
+      )}
       <div className="panel table-wrap">
         <table>
-          <thead>
-            <tr>
-              <th>Rank</th>
-              <th>User</th>
-              <th>Accepted submissions</th>
-              <th>Attempts</th>
-            </tr>
-          </thead>
+          <thead><tr><th>Rank</th><th>User</th><th>Accepted submissions</th><th>Attempts</th></tr></thead>
           <tbody>
-            {users.map((u, i) => (
-              <tr key={u.username}>
-                <td>
-                  <b>#{i + 1}</b>
-                </td>
-                <td>
-                  <span className="problem-title">{u.username}</span>
-                </td>
-                <td>{u.accepted}</td>
-                <td>{u.attempts}</td>
+            {users.map((user, index) => (
+              <tr key={user.username} className={index < 3 ? `rank-row rank-row-${index + 1}` : undefined}>
+                <td>{index < 3 ? <span className="rank-table-medal">{medals[index]} <b>#{index + 1}</b></span> : <b>#{index + 1}</b>}</td>
+                <td><span className="problem-title">{user.username}</span></td>
+                <td>{user.accepted}</td>
+                <td>{user.attempts}</td>
               </tr>
             ))}
           </tbody>
         </table>
-        {!users.length && <p className="empty">No ranked members yet.</p>}
+        {!users.length && !error && <p className="empty">No ranked members yet.</p>}
       </div>
     </div>
   );
@@ -1112,6 +1127,34 @@ function AdminProblems({ user }) {
       </div>
       {error && <p className="error-msg">{error}</p>}
       {success && <p className="admin-success">{success}</p>}
+      <section className="panel admin-csv-examples" aria-label="CSV examples for problem authors">
+        <div className="panel-head"><FileSpreadsheet size={18} /> Example CSV inputs and outputs</div>
+        <div className="admin-csv-examples-body">
+          <p>Download and edit these files when adding exercises. For Python problems, each CSV row defines a test input and expected output. For AI grading, keep ground truth private and give students only the sample prediction format.</p>
+          <div className="admin-template-grid">
+            <a className="admin-template-link" href="/templates/python-problem-tests.csv" download>
+              <b>Python problem input/output</b><small>Multiple test cases with function signatures</small><span>Download CSV</span>
+            </a>
+            <a className="admin-template-link" href="/templates/ai-ground-truth-example.csv" download>
+              <b>AI ground truth</b><small>Private example target values</small><span>Download CSV</span>
+            </a>
+            <a className="admin-template-link" href="/templates/ai-predictions-example.csv" download>
+              <b>AI sample predictions</b><small>Example expected submission columns</small><span>Download CSV</span>
+            </a>
+          </div>
+          <div className="admin-template-preview">
+            <strong>Python test case preview</strong>
+            <div className="table-wrap"><table>
+              <thead><tr><th>Problem slug</th><th>Input</th><th>Output</th></tr></thead>
+              <tbody>
+                <tr><td>sum-pair</td><td><code>2, 5</code></td><td><code>7</code></td></tr>
+                <tr><td>sum-pair</td><td><code>10, -3</code></td><td><code>7</code></td></tr>
+              </tbody>
+            </table></div>
+            <small>The downloaded CSV uses a newline between positional arguments inside quoted input cells.</small>
+          </div>
+        </div>
+      </section>
       <section className="panel bulk-import">
         <div className="panel-head"><Upload size={18}/> Bulk import Python exercises (CSV)</div>
         <div className="bulk-import-body">
