@@ -21,6 +21,7 @@ import {
   CheckCircle2,
   Clock3,
   ShieldCheck,
+  ChevronLeft,
   ChevronRight,
   Terminal,
   Search,
@@ -29,6 +30,10 @@ import {
   ChevronDown,
   FileSpreadsheet,
   Activity,
+  Download,
+  Database,
+  Trash2,
+  ArchiveRestore,
 } from "lucide-react";
 import MonacoEditor from "@monaco-editor/react";
 import ReactMarkdown from "react-markdown";
@@ -76,6 +81,24 @@ async function request(path, options = {}) {
   const j = await r.json().catch(() => ({}));
   if (!r.ok) throw Error(j.error || `HTTP ${r.status}`);
   return j;
+}
+function formatBytes(bytes) {
+  const value = Number(bytes) || 0;
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 ** 2) return `${(value / 1024).toFixed(1)} KB`;
+  return `${(value / 1024 ** 2).toFixed(1)} MB`;
+}
+function metricLabel(metric) {
+  return String(metric || "score").replaceAll("_", " ").toUpperCase();
+}
+function metricScore(score) {
+  if (score == null || !Number.isFinite(Number(score))) return "—";
+  return Number(score).toFixed(6).replace(/0+$/, "").replace(/\.$/, "");
+}
+function submissionScore(submission) {
+  if (submission?.score == null || !Number.isFinite(Number(submission.score))) return "—";
+  if (submission.kind === "code") return `${Number(submission.score).toFixed(2).replace(/\.00$/, "")}%`;
+  return `${metricScore(submission.score)}${submission.metric ? ` ${metricLabel(submission.metric)}` : ""}`;
 }
 function UserAvatar({ user, className = "" }) {
   const initials = (user?.username || "?").slice(0, 2).toUpperCase();
@@ -468,7 +491,7 @@ function ProfilePage({ user, setUser, username = null }) {
       <section className={`profile-content${isOwn ? "" : " profile-content-public"}`}>
         <div className="panel profile-summary">
           <div className="panel-head"><UserRound size={18} /> Profile overview</div>
-          <dl>
+          <dl className="profile-overview-grid">
             <div><dt>Username</dt><dd>{profile.username}</dd></div>
             {isOwn && <div><dt>Email</dt><dd>{profile.email}</dd></div>}
             <div><dt>Member since</dt><dd>{new Date(profile.created_at).toLocaleDateString()}</dd></div>
@@ -545,6 +568,8 @@ function Problems() {
   const { items, error } = useProblems();
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState("all");
+  const [page, setPage] = useState(1);
+  const pageSize = 12;
   const shown = items.filter((p) => {
     const meta = problemPresentation(p);
     const searchable = `${p.title} ${p.category} ${p.slug} ${meta.track} ${meta.tech}`;
@@ -553,6 +578,10 @@ function Problems() {
       searchable.toLowerCase().includes(search.toLowerCase())
     );
   });
+  const pageCount = Math.max(1, Math.ceil(shown.length / pageSize));
+  const currentPage = Math.min(page, pageCount);
+  const pageItems = shown.slice((currentPage - 1) * pageSize, currentPage * pageSize);
+  useEffect(() => setPage(1), [search, filter]);
   return (
     <div className="shell page arena-page">
       <div className="arena-banner">
@@ -602,7 +631,7 @@ function Problems() {
       </div>
       {error && <p className="error-msg">{error}</p>}
       <div className="arena-grid">
-        {shown.map((p, i) => {
+        {pageItems.map((p, i) => {
           const meta = problemPresentation(p);
           return (
             <Link
@@ -615,7 +644,7 @@ function Problems() {
                   {p.kind === "csv" ? <FileSpreadsheet size={28} /> : <Code2 size={28} />}
                 </div>
                 <strong>{meta.track}</strong>
-                <span className="arena-card-number">#{String(i + 1).padStart(2, "0")}</span>
+                <span className="arena-card-number">#{String((currentPage - 1) * pageSize + i + 1).padStart(2, "0")}</span>
               </div>
               <div className="arena-card-body">
                 <h2>{p.title}</h2>
@@ -636,7 +665,16 @@ function Problems() {
       {!shown.length && !error && (
         <div className="panel empty">No challenges match your search.</div>
       )}
-      <div className="arena-count">Showing {shown.length} challenges</div>
+      {!!shown.length && pageCount > 1 && (
+        <nav className="arena-pagination" aria-label="Challenge pages">
+          <button type="button" aria-label="Previous page" disabled={currentPage === 1} onClick={() => setPage(currentPage - 1)}><ChevronLeft size={17} /></button>
+          {Array.from({ length: pageCount }, (_, index) => index + 1).map((number) => (
+            <button type="button" key={number} className={number === currentPage ? "active" : ""} aria-current={number === currentPage ? "page" : undefined} onClick={() => setPage(number)}>{number}</button>
+          ))}
+          <button type="button" aria-label="Next page" disabled={currentPage === pageCount} onClick={() => setPage(currentPage + 1)}><ChevronRight size={17} /></button>
+        </nav>
+      )}
+      <div className="arena-count">Showing {pageItems.length} of {shown.length} challenges{pageCount > 1 ? ` · Page ${currentPage} of ${pageCount}` : ""}</div>
     </div>
   );
 }
@@ -650,6 +688,8 @@ function ProblemPage({ slug, user }) {
   const [activeTab, setActiveTab] = useState("description");
   const [mySubmissions, setMySubmissions] = useState([]);
   const [solutions, setSolutions] = useState([]);
+  const [leaderboard, setLeaderboard] = useState(null);
+  const [dataFiles, setDataFiles] = useState([]);
   const [solutionSearch, setSolutionSearch] = useState("");
   const [tabLoading, setTabLoading] = useState(false);
   const draftKey = `itclub-draft:${user?.id || "guest"}:${slug}`;
@@ -658,6 +698,13 @@ function ProblemPage({ slug, user }) {
       .then((d) => {
         setProblem(d.problem);
         setCode(localStorage.getItem(draftKey) ?? d.problem.starter ?? "");
+        if (d.problem.kind === "csv") {
+          request(`/problems/${encodeURIComponent(slug)}/data-files`)
+            .then((data) => setDataFiles(data.files || []))
+            .catch(() => setDataFiles([]));
+        } else {
+          setDataFiles([]);
+        }
       })
       .catch((e) => setError(e.message));
   }, [slug]);
@@ -670,13 +717,16 @@ function ProblemPage({ slug, user }) {
       .finally(() => setTabLoading(false));
   }, [activeTab, user, slug, job]);
   useEffect(() => {
-    if (activeTab !== "solutions") return;
+    if (activeTab !== "solutions" || !problem) return;
     setTabLoading(true);
-    request(`/problems/${encodeURIComponent(slug)}/solutions`)
-      .then((data) => setSolutions(data.solutions || []))
+    request(`/problems/${encodeURIComponent(slug)}/${problem.kind === "csv" ? "leaderboard" : "solutions"}`)
+      .then((data) => {
+        if (problem.kind === "csv") setLeaderboard(data);
+        else setSolutions(data.solutions || []);
+      })
       .catch((err) => setError(err.message))
       .finally(() => setTabLoading(false));
-  }, [activeTab, slug]);
+  }, [activeTab, slug, problem?.kind, job]);
   const updateCode = (value) => {
     const next = value ?? "";
     setCode(next);
@@ -695,6 +745,10 @@ function ProblemPage({ slug, user }) {
       .join(" ")
       .toLowerCase()
       .includes(query);
+  });
+  const visibleLeaderboard = (leaderboard?.entries || []).filter((entry) => {
+    const query = solutionSearch.trim().toLowerCase();
+    return !query || entry.username.toLowerCase().includes(query);
   });
   const send = async () => {
     setError("");
@@ -736,7 +790,7 @@ function ProblemPage({ slug, user }) {
           ["description", "Description"],
           ["submit", "Submit"],
           ["my", "My submission"],
-          ["solutions", "All Solutions"],
+          ["solutions", problem.kind === "csv" ? "Leaderboard" : "All Solutions"],
         ].map(([key, label]) => (
           <button key={key} className={activeTab === key ? "active" : ""} onClick={() => { setActiveTab(key); setError(""); }}>
             {label}
@@ -787,7 +841,27 @@ function ProblemPage({ slug, user }) {
                 <p>
                   Scoring metric: <b>{problem.metric}</b>
                 </p>
-                <a className="btn ghost small" href={`/api/problems/${encodeURIComponent(slug)}/sample-submission.csv`} download>Download sample CSV</a>
+                <section className="competition-data" aria-labelledby="competition-data-title">
+                  <div className="competition-data-head">
+                    <div>
+                      <span className="competition-data-icon"><Database size={20} /></span>
+                      <div><h3 id="competition-data-title">Competition data</h3><p>Train a model, predict the test rows, then follow the sample submission schema.</p></div>
+                    </div>
+                  </div>
+                  {dataFiles.length ? (
+                    <div className="competition-file-list">
+                      {dataFiles.map((item) => (
+                        <a key={item.key} className="competition-file" href={`/api/problems/${encodeURIComponent(slug)}/data/${encodeURIComponent(item.key)}`} download>
+                          <FileSpreadsheet size={20} />
+                          <span><b>{item.label}</b><small>{item.name} · {formatBytes(item.size)}</small></span>
+                          <Download size={17} />
+                        </a>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="competition-data-empty">No public dataset files have been attached to this challenge yet.</p>
+                  )}
+                </section>
               </>
             )}
           </div>
@@ -881,36 +955,65 @@ function ProblemPage({ slug, user }) {
         <section className="panel solutions-table-panel">
           <div className="solutions-toolbar">
             <div>
-              <h3>All submissions</h3>
-              <p>Submission history from club members.</p>
+              <h3>{problem.kind === "csv" ? "Challenge leaderboard" : "All submissions"}</h3>
+              <p>{problem.kind === "csv"
+                ? `${metricLabel(leaderboard?.metric || problem.metric)} · ${leaderboard?.greater_is_better ? "Higher is better" : "Lower is better"}`
+                : "Submission history from club members."}</p>
             </div>
             <label className="solutions-search">
               <Search size={16} />
-              <input value={solutionSearch} onChange={(event) => setSolutionSearch(event.target.value)} placeholder="Search user or status..." />
+              <input value={solutionSearch} onChange={(event) => setSolutionSearch(event.target.value)} placeholder={problem.kind === "csv" ? "Search participant..." : "Search user or status..."} />
             </label>
           </div>
           {tabLoading ? <p className="empty">Loading submissions...</p> : (
-            <div className="table-wrap">
-              <table className="solutions-table">
-                <thead><tr><th>#</th><th>User</th><th>Judge status</th><th>Result</th><th>Language</th><th>Submitted at</th></tr></thead>
-                <tbody>{visibleSolutions.map((solution) => (
-                  <tr key={solution.id}>
-                    <td className="solution-id">#{String(solution.id).slice(0, 8)}</td>
-                    <td>
-                      <Link className="solution-user" to={`/profile/${encodeURIComponent(solution.username)}`}>
-                        <UserAvatar user={solution} className="solution-avatar" />
-                        <b>{solution.username}</b>
+            problem.kind === "csv" ? (
+              <>
+                {!!visibleLeaderboard.length && (
+                  <div className="challenge-podium">
+                    {visibleLeaderboard.slice(0, 3).map((entry) => (
+                      <Link key={entry.best_submission_id} className={`challenge-podium-card challenge-place-${entry.rank}`} to={`/profile/${encodeURIComponent(entry.username)}`}>
+                        <span className="challenge-medal">{entry.rank === 1 ? "🥇" : entry.rank === 2 ? "🥈" : "🥉"}</span>
+                        <UserAvatar user={entry} className="challenge-podium-avatar" />
+                        <b>{entry.username}</b>
+                        <strong title={String(entry.score)}>{metricScore(entry.score)}</strong>
                       </Link>
-                    </td>
-                    <td><span className={`status ${solution.status}`}>{solution.status.replaceAll("_", " ")}</span></td>
-                    <td>{solution.kind === "csv" ? (solution.score == null ? "—" : `${Number(solution.score).toFixed(4)} ${solution.metric || ""}`) : `${solution.passed}/${solution.total} tests`}</td>
-                    <td>{solution.kind === "csv" ? "AI Track" : "Python"}</td>
-                    <td>{new Date(solution.created_at).toLocaleString()}</td>
-                  </tr>
-                ))}</tbody>
-              </table>
-              {!visibleSolutions.length && <p className="empty">No member submissions found.</p>}
-            </div>
+                    ))}
+                  </div>
+                )}
+                <div className="table-wrap">
+                  <table className="solutions-table challenge-leaderboard-table">
+                    <thead><tr><th>Rank</th><th>Participant</th><th>Best score</th><th>Attempts</th><th>Achieved at</th></tr></thead>
+                    <tbody>{visibleLeaderboard.map((entry) => (
+                      <tr key={entry.best_submission_id} className={entry.username === user?.username ? "current-participant" : ""}>
+                        <td className="leaderboard-rank">#{entry.rank}</td>
+                        <td><Link className="solution-user" to={`/profile/${encodeURIComponent(entry.username)}`}><UserAvatar user={entry} className="solution-avatar" /><b>{entry.username}</b>{entry.username === user?.username && <span className="you-badge">You</span>}</Link></td>
+                        <td><b title={String(entry.score)}>{metricScore(entry.score)}</b> <small>{metricLabel(leaderboard?.metric)}</small></td>
+                        <td>{entry.attempts}</td>
+                        <td>{new Date(entry.achieved_at).toLocaleString()}</td>
+                      </tr>
+                    ))}</tbody>
+                  </table>
+                  {!visibleLeaderboard.length && <p className="empty">The leaderboard will appear after the first accepted CSV submission.</p>}
+                </div>
+              </>
+            ) : (
+              <div className="table-wrap">
+                <table className="solutions-table">
+                  <thead><tr><th>#</th><th>User</th><th>Judge status</th><th>Score</th><th>Language</th><th>Submitted at</th></tr></thead>
+                  <tbody>{visibleSolutions.map((solution) => (
+                    <tr key={solution.id}>
+                      <td className="solution-id">#{String(solution.id).slice(0, 8)}</td>
+                      <td><Link className="solution-user" to={`/profile/${encodeURIComponent(solution.username)}`}><UserAvatar user={solution} className="solution-avatar" /><b>{solution.username}</b></Link></td>
+                      <td><span className={`status ${solution.status}`}>{solution.status.replaceAll("_", " ")}</span></td>
+                      <td><b>{submissionScore(solution)}</b></td>
+                      <td>Python</td>
+                      <td>{new Date(solution.created_at).toLocaleString()}</td>
+                    </tr>
+                  ))}</tbody>
+                </table>
+                {!visibleSolutions.length && <p className="empty">No member submissions found.</p>}
+              </div>
+            )
           )}
           {error && <p className="error-msg">{error}</p>}
         </section>
@@ -1103,8 +1206,7 @@ function Submissions({ user }) {
             <tr>
               <th>Problem</th>
               <th>Type</th>
-              <th>Status</th>
-              <th>Passed</th>
+              <th>Score</th>
               <th>Date</th>
               <th></th>
             </tr>
@@ -1114,16 +1216,11 @@ function Submissions({ user }) {
               <tr key={s.id}>
                 <td>
                   <Link to={"/submissions/" + s.id} className="problem-title">
-                    {s.problem_slug}
+                    {s.problem_title || s.problem_slug}
                   </Link>
                 </td>
-                <td>{s.kind}</td>
-                <td>
-                  <span className={"status " + s.status}>{s.status}</span>
-                </td>
-                <td>
-                  {s.passed}/{s.total}
-                </td>
+                <td>{s.problem_category || (s.kind === "csv" ? "AI Track" : "Function Only")}</td>
+                <td><b>{submissionScore(s)}</b></td>
                 <td>{new Date(s.created_at).toLocaleString()}</td>
                 <td>
                   <Link to={"/submissions/" + s.id}>
@@ -1169,7 +1266,7 @@ function Ranklist() {
                 <UserAvatar user={user} className="rank-avatar" />
                 <div className="rank-place">{places[index]}</div>
                 <Link className="rank-name" to={`/profile/${encodeURIComponent(user.username)}`}>{user.username}</Link>
-                <div className="rank-score"><b>{user.solved}</b><span>problems solved</span></div>
+                <div className="rank-score"><b>{user.solved}</b><span>Function Only solved</span></div>
                 <div className="rank-attempts">{user.attempts} attempts</div>
                 <div className="rank-stand" aria-hidden="true">{index + 1}</div>
               </article>
@@ -1179,7 +1276,7 @@ function Ranklist() {
       )}
       <div className="panel table-wrap">
         <table>
-          <thead><tr><th>Rank</th><th>User</th><th>Solved problems</th><th>Attempts</th></tr></thead>
+          <thead><tr><th>Rank</th><th>User</th><th>Function Only solved</th><th>Attempts</th></tr></thead>
           <tbody>
             {users.map((user, index) => (
               <tr key={user.username} className={index < 3 ? `rank-row rank-row-${index + 1}` : undefined}>
@@ -1226,6 +1323,12 @@ const defaultCsvConfig = {
   greater_is_better: false,
   allow_extra_columns: false,
 };
+const competitionUploadFields = [
+  { key: "train", field: "train_data", filename: "train.csv", label: "Training dataset", accept: ".csv,text/csv", help: "Public · includes features and training labels" },
+  { key: "test", field: "test_data", filename: "test.csv", label: "Test dataset", accept: ".csv,text/csv", help: "Public · features that participants must predict" },
+  { key: "sample_submission", field: "sample_submission", filename: "sample_submission.csv", label: "Sample submission", accept: ".csv,text/csv", help: "Public · exact schema required by the Judge" },
+  { key: "bundle", field: "data_bundle", filename: "data.zip", label: "Data bundle", accept: ".zip,application/zip", help: "Public · optional archive containing competition resources" },
+];
 // Editable text cases are serialized to the original structured worker protocol.
 const plainValue = v => typeof v === 'string' ? v : JSON.stringify(v ?? null);
 const displayTests = tests => (tests || []).map(t => ({input:(t.args || []).map(plainValue).join("\n"),output:plainValue(t.expected)}));
@@ -1249,6 +1352,12 @@ function AdminProblems({ user }) {
     [model, setModel] = useState(emptyAdmin),
     [truth, setTruth] = useState(null),
     [sample, setSample] = useState(null),
+    [datasetUploads, setDatasetUploads] = useState({ train_data: null, test_data: null, data_bundle: null }),
+    [removeFiles, setRemoveFiles] = useState([]),
+    [statusFilter, setStatusFilter] = useState("all"),
+    [deleteTarget, setDeleteTarget] = useState(null),
+    [deleteConfirmation, setDeleteConfirmation] = useState(""),
+    [datasetMaxMb, setDatasetMaxMb] = useState(100),
     [importFile, setImportFile] = useState(null),
     [importing, setImporting] = useState(false),
     [busy, setBusy] = useState(false),
@@ -1256,7 +1365,7 @@ function AdminProblems({ user }) {
     [success, setSuccess] = useState("");
   const load = () =>
     request("/admin/problems")
-      .then((d) => setItems(d.problems))
+      .then((d) => { setItems(d.problems); setDatasetMaxMb(d.dataset_max_mb || 100); })
       .catch((e) => setError(e.message));
   useEffect(() => {
     if (user?.role === "admin") load();
@@ -1265,6 +1374,8 @@ function AdminProblems({ user }) {
     setEditing(problem?.slug || null);
     setTruth(null);
     setSample(null);
+    setDatasetUploads({ train_data: null, test_data: null, data_bundle: null });
+    setRemoveFiles([]);
     setError("");
     setSuccess("");
     setModel(
@@ -1325,6 +1436,8 @@ function AdminProblems({ user }) {
       if (model.kind === "code") body.set("tests", JSON.stringify(model.tests));
       if (truth) body.set("ground_truth", truth);
       if (sample) body.set("sample_submission", sample);
+      for (const [key, file] of Object.entries(datasetUploads)) if (file) body.set(key, file);
+      for (const key of removeFiles) body.set(`remove_${key}`, "true");
       await request(
         "/admin/problems" + (editing ? "/" + encodeURIComponent(editing) : ""),
         { method: editing ? "PUT" : "POST", body },
@@ -1338,6 +1451,8 @@ function AdminProblems({ user }) {
       setModel(emptyAdmin);
       setTruth(null);
       setSample(null);
+      setDatasetUploads({ train_data: null, test_data: null, data_bundle: null });
+      setRemoveFiles([]);
       await load();
     } catch (err) {
       setError(err.message);
@@ -1364,6 +1479,36 @@ function AdminProblems({ user }) {
       setError(e.message);
     }
   };
+  const unarchive = async (slug) => {
+    setError(""); setSuccess("");
+    try {
+      await request(`/admin/problems/${encodeURIComponent(slug)}/unarchive`, { method: "POST" });
+      setSuccess("Exercise restored to AI Arena");
+      await load();
+    } catch (e) { setError(e.message); }
+  };
+  const openPermanentDelete = (problem) => {
+    setDeleteTarget(problem);
+    setDeleteConfirmation("");
+    setError("");
+  };
+  const permanentlyDelete = async () => {
+    if (!deleteTarget || deleteConfirmation !== deleteTarget.slug) return;
+    setBusy(true); setError(""); setSuccess("");
+    try {
+      const result = await request(`/admin/problems/${encodeURIComponent(deleteTarget.slug)}/permanent`, {
+        method: "DELETE",
+        body: JSON.stringify({ confirm_slug: deleteConfirmation }),
+      });
+      setSuccess(`Exercise deleted with ${result.deleted_submissions} submission(s).`);
+      if (editing === deleteTarget.slug) start(null);
+      setDeleteTarget(null); setDeleteConfirmation("");
+      await load();
+    } catch (e) { setError(e.message); }
+    finally { setBusy(false); }
+  };
+  const toggleRemoval = (key) => setRemoveFiles((current) => current.includes(key) ? current.filter((item) => item !== key) : [...current, key]);
+  const visibleItems = items.filter((problem) => statusFilter === "all" || (statusFilter === "active" ? problem.active : !problem.active));
   if (!user)
     return (
       <div className="shell page">
@@ -1436,15 +1581,20 @@ function AdminProblems({ user }) {
               {items.filter((p) => p.active).length} active
             </span>
           </div>
+          <div className="admin-status-filters" role="group" aria-label="Filter exercises by status">
+            {[['all','All'],['active','Active'],['archived','Archived']].map(([key,label]) => (
+              <button key={key} type="button" className={statusFilter === key ? "active" : ""} onClick={() => setStatusFilter(key)}>{label}</button>
+            ))}
+          </div>
           <div className="admin-list">
-            {items.map((p) => (
-              <div key={p.slug} className="admin-item">
+            {visibleItems.map((p) => (
+              <div key={p.slug} className={`admin-item${p.active ? "" : " archived"}`}>
                 <div>
-                  <b>{p.title}</b>
+                  <b>{p.title} {!p.active && <span className="archived-badge">Archived</span>}</b>
                   <small>
                     {p.slug} ·{" "}
                     {p.kind === "csv" ? "CSV scoring" : "Python tests"} ·{" "}
-                    {p.active ? "Active" : "Archived"}
+                    {p.deletion_preview?.submissions || 0} submissions
                   </small>
                 </div>
                 <div className="admin-actions">
@@ -1459,10 +1609,16 @@ function AdminProblems({ user }) {
                       Archive
                     </button>
                   )}
+                  {!p.active && (
+                    <>
+                      <button className="btn ghost small" onClick={() => unarchive(p.slug)}><ArchiveRestore size={14} /> Unarchive</button>
+                      <button className="btn danger small" onClick={() => openPermanentDelete(p)}><Trash2 size={14} /> Delete</button>
+                    </>
+                  )}
                 </div>
               </div>
             ))}
-            {!items.length && <p className="empty">No exercises yet</p>}
+            {!visibleItems.length && <p className="empty">No exercises match this filter.</p>}
           </div>
           <div className="admin-list-foot">
             <button className="btn primary small" onClick={() => start(null)}>
@@ -1600,15 +1756,31 @@ function AdminProblems({ user }) {
                     required={!editing}
                     onChange={(e) => setTruth(e.target.files?.[0] || null)}
                   />
+                  <small>Private · used only by CSV Judge and never exposed by a download API.</small>
                 </label>
-                <label>
-                  Sample submission CSV (optional)
-                  <input
-                    type="file"
-                    accept=".csv,text/csv"
-                    onChange={(e) => setSample(e.target.files?.[0] || null)}
-                  />
-                </label>
+                <div className="competition-upload-editor">
+                  <div className="admin-test-header"><h3>Competition data</h3><small>Public files shown on the challenge page. Maximum combined challenge size: {datasetMaxMb} MB.</small></div>
+                  {competitionUploadFields.map((definition) => {
+                    const existing = model.data_files?.find((file) => file.name === definition.filename);
+                    const selected = definition.field === "sample_submission" ? sample : datasetUploads[definition.field];
+                    const markedForRemoval = removeFiles.includes(definition.key);
+                    return (
+                      <div className={`competition-upload-row${markedForRemoval ? " removing" : ""}`} key={definition.key}>
+                        <div><b>{definition.label}</b><small>{definition.help}</small>{existing && <span>{existing.name} · {formatBytes(existing.size)}</span>}</div>
+                        <input type="file" accept={definition.accept} onChange={(event) => {
+                          const next = event.target.files?.[0] || null;
+                          if (definition.field === "sample_submission") setSample(next);
+                          else setDatasetUploads((current) => ({ ...current, [definition.field]: next }));
+                          if (next) setRemoveFiles((current) => current.filter((key) => key !== definition.key));
+                        }} />
+                        {selected && <small className="selected-file">Selected: {selected.name}</small>}
+                        {editing && existing && (
+                          <label className="remove-file-toggle"><input type="checkbox" checked={markedForRemoval} disabled={Boolean(selected)} onChange={() => toggleRemoval(definition.key)} /> Remove existing file</label>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
               </>
             )}
             <div className="admin-submit">
@@ -1630,6 +1802,22 @@ function AdminProblems({ user }) {
           </form>
         </section>
       </div>
+      {deleteTarget && (
+        <div className="confirm-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) setDeleteTarget(null); }}>
+          <section className="confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="delete-problem-title">
+            <span className="confirm-danger-icon"><Trash2 size={24} /></span>
+            <h2 id="delete-problem-title">Delete exercise permanently?</h2>
+            <p>This cannot be undone. The exercise, all submission history and its stored CSV files will be removed.</p>
+            <div className="delete-impact">
+              <span><b>{deleteTarget.deletion_preview?.submissions || 0}</b> submissions</span>
+              <span><b>{deleteTarget.deletion_preview?.files || 0}</b> stored files</span>
+              <span><b>{formatBytes(deleteTarget.deletion_preview?.bytes || 0)}</b> data</span>
+            </div>
+            <label>Type <code>{deleteTarget.slug}</code> to confirm<input autoFocus value={deleteConfirmation} onChange={(event) => setDeleteConfirmation(event.target.value)} /></label>
+            <div className="confirm-actions"><button className="btn ghost" type="button" disabled={busy} onClick={() => setDeleteTarget(null)}>Cancel</button><button className="btn danger" type="button" disabled={busy || deleteConfirmation !== deleteTarget.slug} onClick={permanentlyDelete}>{busy ? "Deleting..." : "Delete permanently"}</button></div>
+          </section>
+        </div>
+      )}
     </div>
   );
 }

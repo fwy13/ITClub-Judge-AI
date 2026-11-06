@@ -28,8 +28,8 @@ The previous release had no exercise upload page. This release adds **`/admin/pr
 Navigate to **http://localhost:8080/admin/problems** or click **Admin** in the top navigation. You can:
 
 - Create Python coding problems with slug, title, category, difficulty, description, function name, optional class name, starter source, and an array of 1–100 test cases (`[{"args":[2],"expected":4}]`). The first case is a public sample; other cases are hidden from the learner-facing API.
-- Create CSV grading problems by providing an accepted `csv-judge` configuration JSON, a required ground-truth CSV, and an optional sample-submission CSV. Supported tasks include binary and multiclass classification, multilabel, regression, ranking, and text generation. Example scoring JSON is available in the `csv-judge/problems/example_*` directories. CSV files are restricted to 10 MB.
-- Edit published problems (without changing slug/type), and archive problems without deleting historical student submissions.
+- Create CSV grading problems with a private ground-truth file plus optional train, test, sample-submission and public ZIP bundle files. Supported tasks include binary and multiclass classification, multilabel, regression, ranking, and text generation. The combined challenge limit defaults to 100 MB and is configurable through `DATASET_MAX_MB`.
+- Edit and archive published problems, restore archived problems, or permanently delete an archived problem together with its submissions and CSV files after typing its exact slug.
 
 New exercises are stored in PostgreSQL; uploaded CSV data lives in the persistent `csvdata` Docker volume shared between the API and CSV scorer. Seed exercises from `platform-api/problems.json` are imported once; editing does not require editing the JSON source or rebuilding images. Archived problems disappear from the public catalog, but historical submission records remain available.
 
@@ -50,17 +50,22 @@ CSV submissions emit one completed event after metric calculation, not per-row u
 | `/api/auth/me` | GET | Yes | Current user |
 | `/api/problems` | GET | No | Public problem catalog |
 | `/api/problems/:slug` | GET | No | Problem detail, only first sample test |
+| `/api/problems/:slug/data-files` | GET | No | Allowlisted public CSV challenge files |
+| `/api/problems/:slug/data/:fileKey` | GET | No | Download train/test/sample/bundle; private judge files are never served |
+| `/api/problems/:slug/leaderboard` | GET | No | Best accepted raw metric per participant for a CSV problem |
 | `/api/submissions/code` | POST | Yes | `{slug,code}` |
 | `/api/submissions/csv` | POST | Yes | `multipart/form-data` with `slug` and `file` |
 | `/api/submissions` | GET | Yes | History |
 | `/api/submissions/:id` | GET | Yes | Result |
-| `/api/leaderboard` | GET | No | Accepted submission totals |
+| `/api/leaderboard` | GET | No | Function Only solved-problem ranking; CSV challenges use their own leaderboard |
 | `/api/contests` | GET | No | Empty until contests implemented |
 | `/api/admin/problems` | GET | Admin | List exercises including full test definitions |
 | `/api/admin/problems/:slug` | GET | Admin | Edit details |
 | `/api/admin/problems` | POST | Admin | Create exercise (`multipart/form-data`) |
 | `/api/admin/problems/:slug` | PUT | Admin | Update exercise (`multipart/form-data`) |
 | `/api/admin/problems/:slug` | DELETE | Admin | Archive exercise |
+| `/api/admin/problems/:slug/unarchive` | POST | Admin | Restore an archived exercise |
+| `/api/admin/problems/:slug/permanent` | DELETE | Admin | Permanently delete an archived exercise and its submissions/files |
 | `/api/health` | GET | No | API status |
 | `/ws` | WS | Message auth | `{"type":"subscribe","token":"<jwt>","submission_id":"<uuid>"}` |
 

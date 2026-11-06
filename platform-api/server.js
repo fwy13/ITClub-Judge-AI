@@ -9,7 +9,8 @@ import axios from 'axios';
 import { WebSocketServer } from 'ws';
 import http from 'node:http';
 import { randomUUID } from 'node:crypto';
-import { readFile, mkdir, writeFile, rename, rm } from 'node:fs/promises';
+import { readFile, mkdir, writeFile, rename, rm, copyFile, stat, readdir, statfs, open, chmod } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import path from 'node:path';
 import {parse as parseCsv} from 'csv-parse/sync';
 
@@ -39,7 +40,18 @@ function publicSignature(p) {
     if (p.class_name) return `class ${p.class_name}:\n    ${declaration}\n        pass`;
     return `${declaration}\n    pass`;
 }
-const publicProblem = p => ({ slug: p.slug, title: p.title, category: p.category, difficulty: p.difficulty, kind: p.kind, description: p.description, starter: publicSignature(p), metric: p.metric, sample_tests: p.tests.slice(0, 1).map(t => ({ args: t.args, expected: t.expected })) });
+const publicProblem = p => ({
+    slug: p.slug,
+    title: p.title,
+    category: p.category,
+    difficulty: p.difficulty,
+    kind: p.kind,
+    description: p.description,
+    starter: publicSignature(p),
+    metric: p.metric,
+    greater_is_better: p.kind === 'csv' ? Boolean(p.config?.greater_is_better) : null,
+    sample_tests: (p.tests || []).slice(0, 1).map(t => ({ args: t.args, expected: t.expected })),
+});
 const asyncRoute = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 const tokenFor = user => jwt.sign({ id: user.id, username: user.username, role: user.role || 'student' }, secret, { expiresIn: '12h', issuer: 'itclub-judge' });
 const verify = token => jwt.verify(token, secret, { issuer: 'itclub-judge' });
@@ -64,7 +76,13 @@ async function admin(req, res, next) {
 function send(socket, payload) { if (socket.readyState === 1) socket.send(JSON.stringify(payload)) }
 function broadcast(id, event) { for (const ws of sockets.get(id) || []) send(ws, event) }
 function subscribe(ws, id) { let s = sockets.get(id); if (!s) { s = new Set(); sockets.set(id, s) } s.add(ws); ws._subscriptions.add(id) }
-async function getSubmission(id, uid) { const q = await pool.query('SELECT id,problem_slug,kind,status,passed,total,score,metric,results,error,created_at FROM submissions WHERE id=$1 AND user_id=$2', [id, uid]); return q.rows[0] || null }
+async function getSubmission(id, uid) {
+    const q = await pool.query(`SELECT id,problem_slug,kind,status,passed,total,
+        CASE WHEN kind='code' AND total>0 THEN passed::double precision*100/total ELSE score END AS score,
+        CASE WHEN kind='code' THEN 'AC rate' ELSE metric END AS metric,results,error,created_at
+        FROM submissions WHERE id=$1 AND user_id=$2`, [id, uid]);
+    return q.rows[0] || null;
+}
 wss.on('connection', ws => {
     ws._subscriptions = new Set();
     ws.on('message', async raw => {
@@ -97,9 +115,9 @@ async function gradeCode(id, problem, code) {
             const message = e.response?.data?.error || e.message;
             results.push({ index: i, status: 'runtime_error', ...(i === 0 ? { error: String(message).slice(0, 500) } : {}) });
         }
-        await update(id, { passed, total: tests.length, results: JSON.stringify(results), status: 'running' }, 'test_completed');
+        await update(id, { passed, total: tests.length, score: tests.length ? passed * 100 / tests.length : 0, metric: 'AC rate', results: JSON.stringify(results), status: 'running' }, 'test_completed');
     }
-    await update(id, { status: passed === tests.length ? 'accepted' : 'failed', passed, total: tests.length, results: JSON.stringify(results) }, 'completed');
+    await update(id, { status: passed === tests.length ? 'accepted' : 'failed', passed, total: tests.length, score: tests.length ? passed * 100 / tests.length : 0, metric: 'AC rate', results: JSON.stringify(results) }, 'completed');
 }
 async function gradeCsv(id, slug, buffer) {
     try {
@@ -111,14 +129,88 @@ const seededProblems = JSON.parse(await readFile(new URL('./problems.json', impo
 async function listProblems() {
     const q = await pool.query(`SELECT p.data,COUNT(s.id)::int AS submissions,COUNT(DISTINCT s.user_id)::int AS participants
         FROM problems p LEFT JOIN submissions s ON s.problem_slug=p.slug
-        WHERE p.active=true GROUP BY p.slug,p.data,p.created_at ORDER BY p.created_at,p.slug`);
+        WHERE p.active=true GROUP BY p.slug,p.data,p.created_at ORDER BY p.created_at DESC,p.slug DESC`);
     return q.rows;
 }
 async function findProblem(slug) { const q = await pool.query('SELECT data FROM problems WHERE slug=$1 AND active=true', [slug]); return q.rows[0]?.data || null }
 const csvRoot = process.env.CSV_PROBLEMS_DIR || '/data/csv-problems';
+const uploadTmp = process.env.DATASET_UPLOAD_TMP || '/tmp/itclub-dataset-uploads';
+const datasetMaxMb = Math.min(1024, Math.max(10, Number(process.env.DATASET_MAX_MB) || 100));
+const datasetMaxBytes = datasetMaxMb * 1024 * 1024;
+const bundledCsvRoot = '/csv-bundled-problems';
+const PUBLIC_DATA_FILES = Object.freeze({
+    train: { filename: 'train.csv', field: 'train_data', label: 'Training data', contentType: 'text/csv' },
+    test: { filename: 'test.csv', field: 'test_data', label: 'Test data', contentType: 'text/csv' },
+    sample_submission: { filename: 'sample_submission.csv', field: 'sample_submission', label: 'Sample submission', contentType: 'text/csv' },
+    bundle: { filename: 'data.zip', field: 'data_bundle', label: 'Competition data bundle', contentType: 'application/zip' },
+});
+const PRIVATE_DATA_FILES = Object.freeze({
+    ground_truth: { filename: 'ground_truth.csv', field: 'ground_truth' },
+    config: { filename: 'config.json', field: null },
+});
+const ALL_CHALLENGE_FILENAMES = new Set([
+    ...Object.values(PUBLIC_DATA_FILES).map(file => file.filename),
+    ...Object.values(PRIVATE_DATA_FILES).map(file => file.filename),
+]);
 const csvMetrics = { binary_probability: ['log_loss', 'accuracy', 'f1', 'precision', 'recall', 'balanced_accuracy'], multiclass_probability: ['log_loss', 'accuracy', 'macro_f1', 'macro_precision', 'macro_recall'], multilabel_probability: ['micro_f1', 'macro_f1', 'hamming_loss'], regression: ['rmse', 'mae', 'mse', 'r2', 'mape', 'smape'], ranking: ['ndcg_at_k', 'mrr', 'map', 'recall_at_k'], text_generation: ['sacrebleu', 'chrf'] };
 const validateSlug = s => typeof s === 'string' && /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(s) && s.length <= 80;
+// Older bundled challenges use underscores. Keep their paths manageable while
+// requiring the stricter hyphenated format for newly authored problems.
+const validatePathSlug = s => typeof s === 'string' && /^[a-z0-9]+(?:[-_][a-z0-9]+)*$/.test(s) && s.length <= 80;
 const validText = (s, max = 10000) => typeof s === 'string' && s.trim().length > 0 && s.length <= max;
+function challengeDir(root, slug) {
+    if (!validatePathSlug(slug)) throw Error('Invalid problem slug');
+    const resolvedRoot = path.resolve(root);
+    const candidate = path.resolve(resolvedRoot, slug);
+    if (path.dirname(candidate) !== resolvedRoot) throw Error('Unsafe problem path');
+    return candidate;
+}
+async function regularFileInfo(filePath) {
+    try {
+        const info = await stat(filePath);
+        return info.isFile() ? info : null;
+    } catch (error) {
+        if (error.code === 'ENOENT') return null;
+        throw error;
+    }
+}
+async function publicDataFiles(slug) {
+    const files = [];
+    for (const [key, definition] of Object.entries(PUBLIC_DATA_FILES)) {
+        for (const root of [csvRoot, bundledCsvRoot]) {
+            const filePath = path.join(challengeDir(root, slug), definition.filename);
+            const info = await regularFileInfo(filePath);
+            if (info) {
+                files.push({ key, name: definition.filename, label: definition.label, size: info.size, content_type: definition.contentType });
+                break;
+            }
+        }
+    }
+    return files;
+}
+async function locatePublicDataFile(slug, key) {
+    const definition = PUBLIC_DATA_FILES[key];
+    if (!definition) return null;
+    for (const root of [csvRoot, bundledCsvRoot]) {
+        const filePath = path.join(challengeDir(root, slug), definition.filename);
+        const info = await regularFileInfo(filePath);
+        if (info) return { ...definition, path: filePath, size: info.size };
+    }
+    return null;
+}
+async function challengeFileSummary(slug) {
+    const dir = challengeDir(csvRoot, slug);
+    let entries = [];
+    try { entries = await readdir(dir, { withFileTypes: true }); }
+    catch (error) { if (error.code !== 'ENOENT') throw error; }
+    const files = [];
+    for (const entry of entries) {
+        if (!entry.isFile() || !ALL_CHALLENGE_FILENAMES.has(entry.name)) continue;
+        const info = await stat(path.join(dir, entry.name));
+        files.push({ name: entry.name, size: info.size, public: Object.values(PUBLIC_DATA_FILES).some(file => file.filename === entry.name) });
+    }
+    return { files, bytes: files.reduce((total, file) => total + file.size, 0) };
+}
 function parseJson(v) { if (typeof v === 'object' && v !== null) return v; try { return JSON.parse(v || '') } catch { return null } }
 // Each nonempty line is a positional argument. JSON literals are accepted for
 // structured values; other text is interpreted as an ordinary string.
@@ -153,6 +245,19 @@ function problemFields(body) {
 }
 
 async function initialize() {
+    await mkdir(uploadTmp, { recursive: true, mode: 0o700 });
+    await mkdir(csvRoot, { recursive: true, mode: 0o755 });
+    // The API and CSV judge run as different unprivileged users while sharing
+    // this volume. Repair permissions from older releases before serving jobs.
+    await chmod(csvRoot, 0o755);
+    for (const entry of await readdir(csvRoot, { withFileTypes: true })) {
+        if (!entry.isDirectory() || !validatePathSlug(entry.name)) continue;
+        const dir = challengeDir(csvRoot, entry.name);
+        await chmod(dir, 0o755);
+        for (const file of await readdir(dir, { withFileTypes: true })) {
+            if (file.isFile()) await chmod(path.join(dir, file.name), 0o644);
+        }
+    }
     await pool.query(`CREATE TABLE IF NOT EXISTS users(id UUID PRIMARY KEY,username VARCHAR(40) NOT NULL UNIQUE,email VARCHAR(255) NOT NULL UNIQUE,password_hash TEXT NOT NULL,created_at TIMESTAMPTZ NOT NULL DEFAULT now())`);
     await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS role VARCHAR(16) NOT NULL DEFAULT 'student'");
     await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar TEXT");
@@ -168,6 +273,7 @@ async function initialize() {
 
     await pool.query(`CREATE TABLE IF NOT EXISTS submissions(id UUID PRIMARY KEY,user_id UUID NOT NULL REFERENCES users(id),problem_slug VARCHAR(100) NOT NULL,kind VARCHAR(10) NOT NULL,status VARCHAR(30) NOT NULL DEFAULT 'queued',code TEXT,passed INT NOT NULL DEFAULT 0,total INT NOT NULL DEFAULT 0,score DOUBLE PRECISION,metric VARCHAR(100),results JSONB NOT NULL DEFAULT '[]'::jsonb,error TEXT,created_at TIMESTAMPTZ NOT NULL DEFAULT now())`);
     await pool.query('CREATE INDEX IF NOT EXISTS submissions_user_id_idx ON submissions(user_id,created_at DESC)');
+    await pool.query('CREATE INDEX IF NOT EXISTS submissions_problem_score_idx ON submissions(problem_slug,user_id,status,score,created_at)');
 }
 app.get('/api/health', (_req, res) => res.json({ status: 'ok', services: ['auth-api', 'rust-worker', 'csv-judge'] }));
 app.post('/api/auth/register', asyncRoute(async (req, res) => {
@@ -216,6 +322,18 @@ app.get('/api/problems', asyncRoute(async (_req, res) => {
     res.json({ problems: rows.map(r => ({ ...publicProblem(r.data), submissions: r.submissions, participants: r.participants })) });
 }));
 app.get('/api/problems/:slug', asyncRoute(async (req, res) => { const p = await findProblem(req.params.slug); if (!p) return res.status(404).json({ error: 'Not found' }); res.json({ problem: publicProblem(p) }) }));
+app.get('/api/problems/:slug/data-files', asyncRoute(async (req, res) => {
+    const problem = await findProblem(req.params.slug);
+    if (!problem || problem.kind !== 'csv') return res.status(404).json({ error: 'CSV problem not found' });
+    res.json({ files: await publicDataFiles(problem.slug), max_challenge_size_mb: datasetMaxMb });
+}));
+app.get('/api/problems/:slug/data/:fileKey', asyncRoute(async (req, res) => {
+    const problem = await findProblem(req.params.slug);
+    if (!problem || problem.kind !== 'csv') return res.status(404).json({ error: 'CSV problem not found' });
+    const file = await locatePublicDataFile(problem.slug, req.params.fileKey);
+    if (!file) return res.status(404).json({ error: 'Competition file not found' });
+    res.type(file.contentType).download(file.path, `${problem.slug}-${file.filename}`);
+}));
 // Public samples only: never expose hidden tests or private CSV ground truth.
 app.get('/api/problems/:slug/sample-input.txt', asyncRoute(async(req,res) => {
     const p = await findProblem(req.params.slug);
@@ -226,34 +344,73 @@ app.get('/api/problems/:slug/sample-input.txt', asyncRoute(async(req,res) => {
 app.get('/api/problems/:slug/sample-submission.csv', asyncRoute(async(req,res) => {
     const p = await findProblem(req.params.slug);
     if (!p || p.kind !== 'csv') return res.status(404).json({error:'Sample not found'});
-    for (const base of [csvRoot, '/csv-bundled-problems']) {
-        try { const contents = await readFile(path.join(base,p.slug,'sample_submission.csv')); return res.type('text/csv').attachment(`${p.slug}-sample-submission.csv`).send(contents) }
-        catch (e) { if (e.code !== 'ENOENT') throw e }
-    }
+    const file = await locatePublicDataFile(p.slug, 'sample_submission');
+    if (file) return res.type(file.contentType).download(file.path, `${p.slug}-sample-submission.csv`);
     res.status(404).json({error:'Sample not found'});
 }));
 app.get('/api/contests', (_req, res) => res.json({ contests: [] }));
 app.get('/api/leaderboard', asyncRoute(async (_req, res) => {
     const q = await pool.query(`SELECT u.username,u.avatar,COUNT(DISTINCT s.problem_slug) FILTER(WHERE s.status='accepted')::int AS solved,COUNT(s.id)::int AS attempts
-        FROM users u LEFT JOIN submissions s ON u.id=s.user_id WHERE u.role<>'admin' GROUP BY u.id ORDER BY solved DESC,attempts ASC,u.username LIMIT 50`);
+        FROM users u LEFT JOIN submissions s ON u.id=s.user_id AND s.kind='code' WHERE u.role<>'admin' GROUP BY u.id ORDER BY solved DESC,attempts ASC,u.username LIMIT 50`);
     res.json({ users: q.rows });
 }));
 app.get('/api/submissions', auth, asyncRoute(async (req, res) => {
     const slug = typeof req.query.slug === 'string' ? req.query.slug : null;
+    const fields = `s.id,s.problem_slug,s.kind,s.status,s.passed,s.total,
+        CASE WHEN s.kind='code' AND s.total>0 THEN s.passed::double precision*100/s.total ELSE s.score END AS score,
+        CASE WHEN s.kind='code' THEN 'AC rate' ELSE s.metric END AS metric,s.created_at,
+        COALESCE(p.data->>'title',s.problem_slug) AS problem_title,
+        COALESCE(p.data->>'category',CASE WHEN s.kind='csv' THEN 'AI Track' ELSE 'Function Only' END) AS problem_category`;
     const q = slug
-        ? await pool.query('SELECT id,problem_slug,kind,status,passed,total,score,metric,created_at FROM submissions WHERE user_id=$1 AND problem_slug=$2 ORDER BY created_at DESC LIMIT 100', [req.user.id, slug])
-        : await pool.query('SELECT id,problem_slug,kind,status,passed,total,score,metric,created_at FROM submissions WHERE user_id=$1 ORDER BY created_at DESC LIMIT 100', [req.user.id]);
+        ? await pool.query(`SELECT ${fields} FROM submissions s LEFT JOIN problems p ON p.slug=s.problem_slug WHERE s.user_id=$1 AND s.problem_slug=$2 ORDER BY s.created_at DESC LIMIT 100`, [req.user.id, slug])
+        : await pool.query(`SELECT ${fields} FROM submissions s LEFT JOIN problems p ON p.slug=s.problem_slug WHERE s.user_id=$1 ORDER BY s.created_at DESC LIMIT 100`, [req.user.id]);
     res.json({ submissions: q.rows });
 }));
 app.get('/api/submissions/:id', auth, asyncRoute(async (req, res) => { const s = await getSubmission(req.params.id, req.user.id); if (!s) return res.status(404).json({ error: 'Not found' }); res.json({ submission: s }) }));
 app.get('/api/problems/:slug/solutions', asyncRoute(async (req, res) => {
     const problem = await findProblem(req.params.slug);
     if (!problem) return res.status(404).json({ error: 'Problem not found' });
-    const q = await pool.query(`SELECT s.id,s.kind,s.status,s.passed,s.total,s.score,s.metric,s.created_at,u.username,u.avatar
+    const q = await pool.query(`SELECT s.id,s.kind,s.status,s.passed,s.total,
+        CASE WHEN s.kind='code' AND s.total>0 THEN s.passed::double precision*100/s.total ELSE s.score END AS score,
+        CASE WHEN s.kind='code' THEN 'AC rate' ELSE s.metric END AS metric,s.created_at,u.username,u.avatar
         FROM submissions s JOIN users u ON u.id=s.user_id
         WHERE s.problem_slug=$1 AND u.role<>'admin'
         ORDER BY s.created_at DESC LIMIT 100`, [req.params.slug]);
     res.json({ solutions: q.rows });
+}));
+app.get('/api/problems/:slug/leaderboard', asyncRoute(async (req, res) => {
+    const problem = await findProblem(req.params.slug);
+    if (!problem || problem.kind !== 'csv') return res.status(404).json({ error: 'CSV problem not found' });
+    const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
+    const limit = Math.min(100, Math.max(10, Number.parseInt(req.query.limit, 10) || 50));
+    const offset = (page - 1) * limit;
+    const direction = problem.config?.greater_is_better ? 'DESC' : 'ASC';
+    const q = await pool.query(`WITH attempts AS (
+            SELECT user_id,COUNT(*)::int AS attempts
+            FROM submissions WHERE problem_slug=$1 GROUP BY user_id
+        ), best AS (
+            SELECT s.id,s.user_id,s.score,s.created_at,u.username,u.avatar,a.attempts,
+                ROW_NUMBER() OVER (PARTITION BY s.user_id ORDER BY s.score ${direction},s.created_at ASC,s.id ASC) AS user_rank
+            FROM submissions s
+            JOIN users u ON u.id=s.user_id
+            JOIN attempts a ON a.user_id=s.user_id
+            WHERE s.problem_slug=$1 AND s.kind='csv' AND s.status='accepted' AND s.score IS NOT NULL AND u.role<>'admin'
+        ), placed AS (
+            SELECT id AS best_submission_id,username,avatar,score,attempts,created_at AS achieved_at,
+                (ROW_NUMBER() OVER (ORDER BY score ${direction},created_at ASC,username ASC))::int AS rank,
+                COUNT(*) OVER ()::int AS total_participants
+            FROM best WHERE user_rank=1
+        )
+        SELECT * FROM placed ORDER BY rank LIMIT $2 OFFSET $3`, [problem.slug, limit, offset]);
+    const totalParticipants = q.rows[0]?.total_participants || 0;
+    res.json({
+        metric: problem.metric,
+        greater_is_better: Boolean(problem.config?.greater_is_better),
+        page,
+        limit,
+        total_participants: totalParticipants,
+        entries: q.rows.map(({ total_participants, ...entry }) => entry),
+    });
 }));
 app.post('/api/submissions/code', auth, rateLimit({ windowMs: 60000, limit: 12 }), asyncRoute(async (req, res) => {
     const { slug, code } = req.body || {}; const p = await findProblem(slug);
@@ -271,8 +428,58 @@ app.post('/api/submissions/csv', auth, rateLimit({ windowMs: 60000, limit: 12 })
     enqueue(() => gradeCsv(id, p.slug, req.file.buffer)); res.status(202).json({ id, status: 'queued' });
 }));
 // Administrator management. The role is always checked against the DB, not only the JWT.
-const adminUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024, files: 2, fields: 30 } });
+const adminUpload = multer({
+    storage: multer.diskStorage({
+        destination: (_req, _file, callback) => callback(null, uploadTmp),
+        filename: (_req, _file, callback) => callback(null, randomUUID()),
+    }),
+    limits: { fileSize: datasetMaxBytes, files: 5, fields: 40 },
+});
 const importUpload = multer({storage: multer.memoryStorage(), limits:{fileSize:2*1024*1024,files:1}});
+const adminFileFields = [
+    { name: 'ground_truth', maxCount: 1 },
+    { name: 'sample_submission', maxCount: 1 },
+    { name: 'train_data', maxCount: 1 },
+    { name: 'test_data', maxCount: 1 },
+    { name: 'data_bundle', maxCount: 1 },
+];
+async function cleanupUploads(req) {
+    const files = Object.values(req.files || {}).flat();
+    await Promise.all(files.map(file => file.path ? rm(file.path, { force: true }).catch(() => {}) : null));
+}
+async function validateUploadedChallengeFile(file, expectedExtension) {
+    if (!file) return;
+    if (!file.originalname.toLowerCase().endsWith(expectedExtension) || !file.size) throw Error(`Invalid ${expectedExtension} upload`);
+    if (expectedExtension === '.zip') {
+        const handle = await open(file.path, 'r');
+        const signature = Buffer.alloc(4);
+        try { await handle.read(signature, 0, 4, 0); }
+        finally { await handle.close(); }
+        if (!(signature[0] === 0x50 && signature[1] === 0x4b && [0x03, 0x05, 0x07].includes(signature[2]))) throw Error('Invalid ZIP upload');
+    }
+}
+async function atomicCopy(sourcePath, dir, filename) {
+    const temporary = path.join(dir, `.${filename}.${randomUUID()}.tmp`);
+    await copyFile(sourcePath, temporary);
+    await chmod(temporary, 0o644);
+    await rename(temporary, path.join(dir, filename));
+}
+async function atomicWrite(buffer, dir, filename) {
+    const temporary = path.join(dir, `.${filename}.${randomUUID()}.tmp`);
+    await writeFile(temporary, buffer, { mode: 0o644 });
+    await rename(temporary, path.join(dir, filename));
+}
+async function ensureChallengeCapacity(slug, uploads, removals) {
+    const summary = await challengeFileSummary(slug);
+    const existing = new Map(summary.files.map(file => [file.name, file.size]));
+    let projected = summary.bytes;
+    for (const filename of removals) projected -= existing.get(filename) || 0;
+    for (const [filename, file] of uploads) projected += file.size - (existing.get(filename) || 0);
+    if (projected > datasetMaxBytes) throw Error(`Challenge files exceed the ${datasetMaxMb} MB limit`);
+    const disk = await statfs(csvRoot);
+    const incomingBytes = [...uploads.values()].reduce((total, file) => total + file.size, 0);
+    if (incomingBytes > Number(disk.bavail) * Number(disk.bsize)) throw Error('Not enough disk space for challenge files');
+}
 app.get('/api/admin/problems/import-template.csv', auth, admin, (_req,res) => {
     const template = 'slug,title,category,difficulty,description,function,class_name,starter,input,output\n' +
       'add-two,Add Two Numbers,Python,Easy,Return the sum of two integers.,add,,"def add(a, b):\n    pass","2\n5",7\n';
@@ -310,43 +517,137 @@ app.post('/api/admin/problems/import-csv', auth, admin, rateLimit({windowMs:6000
     }catch(e) { res.status(400).json({error:String(e.message).slice(0,240)}); }
 }));
 app.get('/api/admin/problems', auth, admin, asyncRoute(async (_req, res) => {
-    const rows = await pool.query('SELECT slug,active,data,created_at,updated_at FROM problems ORDER BY created_at DESC');
-    res.json({ problems: rows.rows.map(r => ({ ...r.data, active: r.active, created_at: r.created_at, updated_at: r.updated_at })) });
+    const rows = await pool.query(`SELECT p.slug,p.active,p.data,p.created_at,p.updated_at,COUNT(s.id)::int AS submission_count
+        FROM problems p LEFT JOIN submissions s ON s.problem_slug=p.slug
+        GROUP BY p.slug,p.active,p.data,p.created_at,p.updated_at ORDER BY p.created_at DESC`);
+    const problems = await Promise.all(rows.rows.map(async r => {
+        const summary = r.data.kind === 'csv' ? await challengeFileSummary(r.slug) : { files: [], bytes: 0 };
+        return {
+            ...r.data,
+            active: r.active,
+            created_at: r.created_at,
+            updated_at: r.updated_at,
+            data_files: summary.files.filter(file => file.public),
+            deletion_preview: { submissions: r.submission_count, files: summary.files.length, bytes: summary.bytes },
+        };
+    }));
+    res.json({ problems, dataset_max_mb: datasetMaxMb });
 }));
 app.get('/api/admin/problems/:slug', auth, admin, asyncRoute(async (req, res) => {
     const q = await pool.query('SELECT data,active FROM problems WHERE slug=$1', [req.params.slug]);
     if (!q.rowCount) return res.status(404).json({ error: 'Not found' }); res.json({ problem: { ...q.rows[0].data, active: q.rows[0].active } });
 }));
 async function saveProblem(req, res, editing = false) {
-    let data; try { data = problemFields(req.body) } catch (e) { return res.status(400).json({ error: e.message }) }
-    if (editing && data.slug !== req.params.slug) return res.status(400).json({ error: 'Slug cannot be changed' });
-    const existing = await pool.query('SELECT data FROM problems WHERE slug=$1', [data.slug]);
-    if (!editing && existing.rowCount) return res.status(409).json({ error: 'Slug already exists' });
-    if (editing && (!existing.rowCount || existing.rows[0].data.kind !== data.kind)) return res.status(400).json({ error: 'Problem not found or kind cannot be changed' });
-    if (data.kind === 'csv') {
-        const truth = req.files?.ground_truth?.[0], sample = req.files?.sample_submission?.[0];
-        const hasDynamicTruth = await import('node:fs').then(m => m.existsSync(path.join(csvRoot, data.slug, 'ground_truth.csv')));
-        if (editing && !truth && !hasDynamicTruth) return res.status(400).json({ error: 'Upload ground truth CSV when editing a bundled CSV problem' });
-        if (!editing && !truth) return res.status(400).json({ error: 'Ground truth CSV required' });
-        if (truth && (!truth.originalname.toLowerCase().endsWith('.csv') || !truth.buffer.length)) return res.status(400).json({ error: 'Invalid ground truth CSV' });
-        if (sample && !sample.originalname.toLowerCase().endsWith('.csv')) return res.status(400).json({ error: 'Invalid sample CSV' });
-        const dir = path.join(csvRoot, data.slug); await mkdir(dir, { recursive: true });
-        // Atomic file replacements prevent the scorer from reading partially written files.
-        async function put(name, buf) { const tmp = path.join(dir, `.${name}.${randomUUID()}.tmp`); await writeFile(tmp, buf, { mode: 0o644 }); await rename(tmp, path.join(dir, name)) }
-        await put('config.json', Buffer.from(JSON.stringify(data.config)));
-        if (truth) await put('ground_truth.csv', truth.buffer);
-        if (sample) await put('sample_submission.csv', sample.buffer);
-        // Full configuration is retained for admin editing but omitted from publicProblem().
+    try {
+        let data;
+        try { data = problemFields(req.body); }
+        catch (error) { return res.status(400).json({ error: error.message }); }
+        if (editing && data.slug !== req.params.slug) return res.status(400).json({ error: 'Slug cannot be changed' });
+        const existing = await pool.query('SELECT data,active FROM problems WHERE slug=$1', [data.slug]);
+        if (!editing && existing.rowCount) return res.status(409).json({ error: 'Slug already exists' });
+        if (editing && (!existing.rowCount || existing.rows[0].data.kind !== data.kind)) return res.status(400).json({ error: 'Problem not found or kind cannot be changed' });
+        if (data.kind === 'csv') {
+            const truth = req.files?.ground_truth?.[0];
+            const sample = req.files?.sample_submission?.[0];
+            const train = req.files?.train_data?.[0];
+            const test = req.files?.test_data?.[0];
+            const bundle = req.files?.data_bundle?.[0];
+            const dir = challengeDir(csvRoot, data.slug);
+            const hasDynamicTruth = existsSync(path.join(dir, 'ground_truth.csv'));
+            if (editing && !truth && !hasDynamicTruth) return res.status(400).json({ error: 'Upload ground truth CSV when editing a bundled CSV problem' });
+            if (!editing && !truth) return res.status(400).json({ error: 'Ground truth CSV required' });
+            try {
+                await validateUploadedChallengeFile(truth, '.csv');
+                await validateUploadedChallengeFile(sample, '.csv');
+                await validateUploadedChallengeFile(train, '.csv');
+                await validateUploadedChallengeFile(test, '.csv');
+                await validateUploadedChallengeFile(bundle, '.zip');
+            } catch (error) {
+                return res.status(400).json({ error: error.message });
+            }
+            const uploads = new Map([
+                ['ground_truth.csv', truth],
+                ['sample_submission.csv', sample],
+                ['train.csv', train],
+                ['test.csv', test],
+                ['data.zip', bundle],
+            ].filter(([, file]) => file));
+            const removals = new Set();
+            for (const [key, definition] of Object.entries(PUBLIC_DATA_FILES)) {
+                if (String(req.body[`remove_${key}`] || '') === 'true') {
+                    if (uploads.has(definition.filename)) return res.status(400).json({ error: `Cannot upload and remove ${definition.filename} together` });
+                    removals.add(definition.filename);
+                }
+            }
+            try { await ensureChallengeCapacity(data.slug, uploads, removals); }
+            catch (error) { return res.status(error.message.startsWith('Challenge files exceed') ? 413 : 400).json({ error: error.message }); }
+            await mkdir(dir, { recursive: true, mode: 0o755 });
+            await chmod(dir, 0o755);
+            await atomicWrite(Buffer.from(JSON.stringify(data.config)), dir, 'config.json');
+            for (const [filename, file] of uploads) await atomicCopy(file.path, dir, filename);
+            for (const filename of removals) await rm(path.join(dir, filename), { force: true });
+            // Full configuration and ground truth remain private and are never served by public data routes.
+        }
+        if (editing) {
+            const r = await pool.query('UPDATE problems SET data=$2::jsonb,updated_at=now() WHERE slug=$1 RETURNING slug,active', [data.slug, JSON.stringify(data)]);
+            if (!r.rowCount) return res.status(404).json({ error: 'Problem not found' });
+        } else {
+            try { await pool.query('INSERT INTO problems(slug,data) VALUES($1,$2::jsonb)', [data.slug, JSON.stringify(data)]); }
+            catch (error) { if (error.code === '23505') return res.status(409).json({ error: 'Slug already exists' }); throw error; }
+        }
+        res.status(editing ? 200 : 201).json({ problem: publicProblem(data), data_files: data.kind === 'csv' ? await publicDataFiles(data.slug) : [] });
+    } finally {
+        await cleanupUploads(req);
     }
-    if (editing) { const r = await pool.query('UPDATE problems SET data=$2::jsonb,active=true,updated_at=now() WHERE slug=$1 RETURNING slug', [data.slug, JSON.stringify(data)]); if (!r.rowCount) return res.status(404).json({ error: 'Problem not found' }); }
-    else { try { await pool.query('INSERT INTO problems(slug,data) VALUES($1,$2::jsonb)', [data.slug, JSON.stringify(data)]) } catch (e) { if (e.code === '23505') return res.status(409).json({ error: 'Slug already exists' }); throw e } }
-    res.status(editing ? 200 : 201).json({ problem: publicProblem(data) });
 }
-app.post('/api/admin/problems', auth, admin, rateLimit({ windowMs: 60000, limit: 20 }), adminUpload.fields([{ name: 'ground_truth', maxCount: 1 }, { name: 'sample_submission', maxCount: 1 }]), asyncRoute(async (req, res) => saveProblem(req, res)));
-app.put('/api/admin/problems/:slug', auth, admin, rateLimit({ windowMs: 60000, limit: 20 }), adminUpload.fields([{ name: 'ground_truth', maxCount: 1 }, { name: 'sample_submission', maxCount: 1 }]), asyncRoute(async (req, res) => saveProblem(req, res, true)));
+app.post('/api/admin/problems', auth, admin, rateLimit({ windowMs: 60000, limit: 20 }), adminUpload.fields(adminFileFields), asyncRoute(async (req, res) => saveProblem(req, res)));
+app.put('/api/admin/problems/:slug', auth, admin, rateLimit({ windowMs: 60000, limit: 20 }), adminUpload.fields(adminFileFields), asyncRoute(async (req, res) => saveProblem(req, res, true)));
 app.delete('/api/admin/problems/:slug', auth, admin, asyncRoute(async (req, res) => {
-    const q = await pool.query('UPDATE problems SET active=false,updated_at=now() WHERE slug=$1 RETURNING slug', [req.params.slug]);
-    if (!q.rowCount) return res.status(404).json({ error: 'Not found' }); res.json({ ok: true });
+    const q = await pool.query('UPDATE problems SET active=false,updated_at=now() WHERE slug=$1 AND active=true RETURNING slug', [req.params.slug]);
+    if (!q.rowCount) return res.status(409).json({ error: 'Problem not found or already archived' });
+    res.json({ ok: true, active: false });
 }));
-app.use((err, _req, res, _next) => { console.error(err); res.status(err.code === 'LIMIT_FILE_SIZE' ? 413 : 500).json({ error: err.code === 'LIMIT_FILE_SIZE' ? 'Uploaded file is too large' : 'Request failed' }) });
+app.post('/api/admin/problems/:slug/unarchive', auth, admin, asyncRoute(async (req, res) => {
+    const q = await pool.query('UPDATE problems SET active=true,updated_at=now() WHERE slug=$1 AND active=false RETURNING slug', [req.params.slug]);
+    if (!q.rowCount) return res.status(409).json({ error: 'Problem not found or already active' });
+    res.json({ ok: true, active: true });
+}));
+app.delete('/api/admin/problems/:slug/permanent', auth, admin, asyncRoute(async (req, res) => {
+    const slug = req.params.slug;
+    if (!validatePathSlug(slug) || req.body?.confirm_slug !== slug) return res.status(400).json({ error: 'Type the exact slug to confirm permanent deletion' });
+    const problem = await pool.query('SELECT data,active FROM problems WHERE slug=$1', [slug]);
+    if (!problem.rowCount) return res.status(404).json({ error: 'Problem not found' });
+    if (problem.rows[0].active) return res.status(409).json({ error: 'Archive the problem before deleting it permanently' });
+    const dir = challengeDir(csvRoot, slug);
+    const trash = path.join(path.resolve(csvRoot), `.trash-${slug}-${randomUUID()}`);
+    let moved = false;
+    if (problem.rows[0].data.kind === 'csv' && existsSync(dir)) { await rename(dir, trash); moved = true; }
+    const client = await pool.connect();
+    let submissionCount = 0;
+    try {
+        await client.query('BEGIN');
+        const submissions = await client.query('DELETE FROM submissions WHERE problem_slug=$1', [slug]);
+        submissionCount = submissions.rowCount;
+        const deleted = await client.query('DELETE FROM problems WHERE slug=$1 AND active=false', [slug]);
+        if (!deleted.rowCount) throw Error('Problem state changed before deletion');
+        await client.query('COMMIT');
+    } catch (error) {
+        await client.query('ROLLBACK');
+        if (moved) await rename(trash, dir).catch(restoreError => console.error('problem file restore failed', restoreError));
+        throw error;
+    } finally { client.release(); }
+    let cleanupPending = false;
+    if (moved) {
+        try { await rm(trash, { recursive: true, force: true }); }
+        catch (error) { cleanupPending = true; console.error('problem file cleanup pending', { slug, trash, error }); }
+    }
+    console.info('admin permanent problem deletion', { admin_id: req.user.id, slug, submissions: submissionCount, files_removed: moved, cleanup_pending: cleanupPending, at: new Date().toISOString() });
+    res.json({ ok: true, deleted_submissions: submissionCount, files_removed: moved, cleanup_pending: cleanupPending });
+}));
+app.use(async (err, req, res, _next) => {
+    await cleanupUploads(req);
+    console.error(err);
+    const uploadLimit = ['LIMIT_FILE_SIZE', 'LIMIT_FILE_COUNT', 'LIMIT_UNEXPECTED_FILE'].includes(err.code);
+    res.status(uploadLimit ? 413 : 500).json({ error: uploadLimit ? `Upload exceeds the ${datasetMaxMb} MB challenge limit or allowed file count` : 'Request failed' });
+});
 await initialize(); server.listen(Number(process.env.PORT || 4000), '0.0.0.0', () => console.log('Platform API listening'));
