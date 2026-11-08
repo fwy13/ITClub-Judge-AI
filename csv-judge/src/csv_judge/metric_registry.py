@@ -66,6 +66,8 @@ def metric_log_loss(data: PreparedData, config: ProblemConfig) -> float:
 def metric_accuracy(data: PreparedData, config: ProblemConfig) -> float:
     if config.task_type == "binary_probability":
         labels = _binary_labels(data, config)
+    elif config.task_type == "multiclass_label":
+        labels = data.y_pred
     else:
         if not isinstance(data.y_pred, pd.DataFrame):
             raise JudgeInternalError(
@@ -139,11 +141,21 @@ def metric_macro_f1(data: PreparedData, config: ProblemConfig) -> float:
                 zero_division=0,
             )
         )
+    labels = (
+        sorted(data.y_true.astype(str).unique().tolist())
+        if config.task_type == "multiclass_label"
+        else config.prediction_columns
+    )
+    predictions = (
+        data.y_pred
+        if config.task_type == "multiclass_label"
+        else _multiclass_labels(data)
+    )
     return float(
         f1_score(
             data.y_true,
-            _multiclass_labels(data),
-            labels=config.prediction_columns,
+            predictions,
+            labels=labels,
             average="macro",
             zero_division=0,
         )
@@ -394,12 +406,12 @@ METRICS: dict[str, MetricSpec] = {
     spec.name: spec
     for spec in (
         _spec("log_loss", {"binary_probability", "multiclass_probability"}, False, metric_log_loss),
-        _spec("accuracy", {"binary_probability", "multiclass_probability"}, True, metric_accuracy),
+        _spec("accuracy", {"binary_probability", "multiclass_probability", "multiclass_label"}, True, metric_accuracy),
         _spec("f1", {"binary_probability"}, True, metric_binary_f1),
         _spec("precision", {"binary_probability"}, True, metric_binary_precision),
         _spec("recall", {"binary_probability"}, True, metric_binary_recall),
         _spec("balanced_accuracy", {"binary_probability"}, True, metric_balanced_accuracy),
-        _spec("macro_f1", {"multiclass_probability", "multilabel_probability"}, True, metric_macro_f1),
+        _spec("macro_f1", {"multiclass_probability", "multiclass_label", "multilabel_probability"}, True, metric_macro_f1),
         _spec("micro_f1", {"multilabel_probability"}, True, metric_micro_f1),
         _spec("hamming_loss", {"multilabel_probability"}, False, metric_hamming_loss),
         _spec("macro_precision", {"multiclass_probability"}, True, metric_macro_precision),

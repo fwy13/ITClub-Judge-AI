@@ -170,3 +170,5 @@ def test_capabilities_cli_reports_registered_combinations(capsys):
     assert "rmse" in payload["regression"]
     assert "sacrebleu" in payload["text_generation"]
     assert "macro_f1" in payload["multiclass_probability"]
+    assert "accuracy" in payload["multiclass_label"]
+    assert "macro_f1" in payload["multiclass_label"]

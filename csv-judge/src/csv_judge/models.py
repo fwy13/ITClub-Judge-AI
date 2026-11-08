@@ -19,6 +19,8 @@ class ProblemConfig(BaseModel):
     task_type: str = Field(min_length=1)
     metric: str = Field(min_length=1)
     greater_is_better: bool = False
+    baseline_score: float | None = Field(default=None, allow_inf_nan=False)
+    perfect_score: float | None = Field(default=None, allow_inf_nan=False)
     max_file_size_mb: int = Field(default=20, gt=0, le=1024)
     max_rows: int = Field(default=100_000, gt=0)
     allow_extra_columns: bool = False

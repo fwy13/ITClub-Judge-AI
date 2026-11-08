@@ -34,12 +34,27 @@ import {
   Database,
   Trash2,
   ArchiveRestore,
+  Star,
 } from "lucide-react";
 import MonacoEditor from "@monaco-editor/react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
+import rehypeKatex from "rehype-katex";
+import "katex/dist/katex.min.css";
 import "./style.css";
 const API = "/api";
+const AUTH_EXPIRED_EVENT = "itclub-auth-expired";
+const AUTH_EXPIRED_MESSAGE =
+  "Your session expired or became invalid after an update. Please sign in again.";
+
+function clearStoredSession(message = "") {
+  localStorage.removeItem("token");
+  localStorage.removeItem("user");
+  if (message) sessionStorage.setItem("auth-message", message);
+  window.dispatchEvent(new Event(AUTH_EXPIRED_EVENT));
+}
+
 function configureProblemEditor(monaco) {
   monaco.editor.defineTheme("itclub-python", {
     base: "vs-dark",
@@ -67,18 +82,34 @@ function configureProblemEditor(monaco) {
     },
   });
 }
+function legacyStarterTemplate(starter) {
+  const source = String(starter || "");
+  const functionName = source.match(/^\s*(?:async\s+)?def\s+([a-zA-Z_][a-zA-Z_0-9]*)/m)?.[1];
+  if (!functionName) return null;
+  const escaped = functionName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const declaration = source.match(new RegExp(`^\\s*(?:async\\s+)?def\\s+${escaped}\\s*\\([^\\n]*\\)\\s*(?:->[^:\\n]+)?\\s*:`, "m"))?.[0]?.trim()
+    || `def ${functionName}(*args, **kwargs):`;
+  const className = source.match(/^\s*class\s+([a-zA-Z_][a-zA-Z_0-9]*)\s*[:(]/m)?.[1];
+  return className ? `class ${className}:\n    ${declaration}\n        pass` : `${declaration}\n    pass`;
+}
 async function request(path, options = {}) {
   const token = localStorage.getItem("token");
+  const isPublicAuth = path === "/auth/login" || path === "/auth/register";
   const isForm = options.body instanceof FormData;
   const r = await fetch(API + path, {
     ...options,
     headers: {
       ...(isForm ? {} : { "Content-Type": "application/json" }),
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(token && !isPublicAuth ? { Authorization: `Bearer ${token}` } : {}),
       ...(options.headers || {}),
     },
   });
   const j = await r.json().catch(() => ({}));
+  if (r.status === 401 && token && !isPublicAuth) {
+    clearStoredSession(AUTH_EXPIRED_MESSAGE);
+    if (window.location.pathname !== "/login") window.location.replace("/login");
+    throw Error(AUTH_EXPIRED_MESSAGE);
+  }
   if (!r.ok) throw Error(j.error || `HTTP ${r.status}`);
   return j;
 }
@@ -100,6 +131,79 @@ function submissionScore(submission) {
   if (submission.kind === "code") return `${Number(submission.score).toFixed(2).replace(/\.00$/, "")}%`;
   return `${metricScore(submission.score)}${submission.metric ? ` ${metricLabel(submission.metric)}` : ""}`;
 }
+function normalizedScore(score) {
+  if (score == null || !Number.isFinite(Number(score))) return "—";
+  return Number(score).toFixed(2).replace(/\.00$/, "");
+}
+function AiTrackScore({ submission, metric = submission?.metric, prominent = false }) {
+  return (
+    <span className={`ai-track-score${prominent ? " prominent" : ""}`}>
+      <strong>{normalizedScore(submission?.normalized_score)}</strong>
+      <span>Raw: {metricScore(submission?.score)}{metric ? ` ${metricLabel(metric)}` : ""}</span>
+    </span>
+  );
+}
+function formatCountdown(milliseconds) {
+  const total = Math.max(0, Math.floor(milliseconds / 1000));
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const seconds = total % 60;
+  return [hours, minutes, seconds].map(value => String(value).padStart(2, "0")).join(":");
+}
+function ContestTimer({ contest, compact = false }) {
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    if (contest?.status !== "open") return undefined;
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [contest?.status, contest?.end_at]);
+  const remaining = contest?.end_at ? new Date(contest.end_at).getTime() - now : 0;
+  const ended = contest?.status === "ended" || remaining <= 0;
+  return (
+    <div className={`contest-timer${compact ? " compact" : ""}${ended ? " ended" : ""}`}>
+      <Clock3 size={compact ? 16 : 20} />
+      <span>{ended ? "Contest ended" : "Time remaining"}</span>
+      {!ended && <strong>{formatCountdown(remaining)}</strong>}
+    </div>
+  );
+}
+function ActiveContestBar({ user }) {
+  const location = useLocation();
+  const [contest, setContest] = useState(null);
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    if (!user) { setContest(null); return undefined; }
+    const load = () => request("/contests").then(data => setContest((data.contests || []).find(item => item.status === "open" && item.joined) || null)).catch(() => setContest(null));
+    load();
+    const poll = setInterval(load, 15000);
+    return () => clearInterval(poll);
+  }, [user?.id, location.pathname]);
+  useEffect(() => {
+    if (!contest) return undefined;
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [contest?.slug]);
+  if (!contest?.start_at || !contest?.end_at) return null;
+  const start = new Date(contest.start_at).getTime();
+  const end = new Date(contest.end_at).getTime();
+  const remaining = end - now;
+  if (remaining <= 0) return null;
+  const progress = Math.min(100, Math.max(0, ((now - start) / Math.max(1, end - start)) * 100));
+  return <Link className="active-contest-bar" to={`/contests/${encodeURIComponent(contest.slug)}`}><span className="active-contest-progress" style={{ width: `${progress}%` }} /><span className="active-contest-content"><span><span className="live-dot" /> LIVE CONTEST</span><b>{contest.title}</b><strong><Clock3 size={15} /> {formatCountdown(remaining)}</strong></span></Link>;
+}
+async function downloadProtected(path, filename) {
+  const token = localStorage.getItem("token");
+  const response = await fetch(API + path, { headers: token ? { Authorization: `Bearer ${token}` } : {} });
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    throw Error(body.error || "Download failed");
+  }
+  const blob = await response.blob();
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url; anchor.download = filename; anchor.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
 function UserAvatar({ user, className = "" }) {
   const initials = (user?.username || "?").slice(0, 2).toUpperCase();
   return (
@@ -113,10 +217,13 @@ function App() {
     JSON.parse(localStorage.getItem("user") || "null"),
   );
   const [drawer, setDrawer] = useState(false);
+  useEffect(() => {
+    const expireSession = () => setUser(null);
+    window.addEventListener(AUTH_EXPIRED_EVENT, expireSession);
+    return () => window.removeEventListener(AUTH_EXPIRED_EVENT, expireSession);
+  }, []);
   const logout = () => {
-    localStorage.removeItem("token");
-    localStorage.removeItem("user");
-    setUser(null);
+    clearStoredSession();
     location.href = "/";
   };
   return (
@@ -149,7 +256,7 @@ function App() {
               <Activity size={16} /> My submissions
             </NavLink>
             {user?.role === "admin" && (
-              <NavLink to="/admin/problems">
+              <NavLink to="/admin/contests">
                 <ShieldCheck size={16} /> Admin
               </NavLink>
             )}
@@ -178,6 +285,7 @@ function App() {
           </div>
         </div>
       </header>
+      <ActiveContestBar user={user} />
       <main>
         <RouterContent user={user} setUser={setUser} />
       </main>
@@ -194,6 +302,7 @@ function App() {
 }
 function RouterContent({ user, setUser }) {
   const p = useLocation().pathname;
+  const segments = p.split("/").filter(Boolean);
   if (p === "/") return <Home />;
   if (p === "/login" || p === "/register")
     return <AuthPage setUser={setUser} register={p === "/register"} />;
@@ -209,8 +318,13 @@ function RouterContent({ user, setUser }) {
   if (p.startsWith("/submissions/"))
     return <SubmissionDetail id={p.split("/")[2]} user={user} />;
   if (p === "/admin/problems") return <AdminProblems user={user} />;
+  if (p === "/admin/contests") return <AdminContests user={user} />;
   if (p === "/ranklist") return <Ranklist />;
-  if (p === "/contests") return <Contests />;
+  if (p === "/contests") return <Contests user={user} />;
+  if (segments[0] === "contests" && segments[2] === "problems" && segments[3])
+    return <ProblemPage contestSlug={decodeURIComponent(segments[1])} slug={decodeURIComponent(segments[3])} user={user} />;
+  if (segments[0] === "contests" && segments[1])
+    return <ContestDetail slug={decodeURIComponent(segments[1])} user={user} />;
   return (
     <div className="shell">
       <h2>Page not found</h2>
@@ -296,6 +410,11 @@ function Home() {
 }
 function AuthPage({ setUser, register }) {
   const nav = useNavigate();
+  const [notice] = useState(() => {
+    const message = sessionStorage.getItem("auth-message") || "";
+    sessionStorage.removeItem("auth-message");
+    return message;
+  });
   const [username, setUsername] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -365,6 +484,7 @@ function AuthPage({ setUser, register }) {
               onChange={(e) => setPassword(e.target.value)}
             />
           </label>
+          {notice && <div className="auth-notice" role="status">{notice}</div>}
           {error && <div className="error-msg">{error}</div>}
           <button disabled={loading} className="btn primary wide">
             {loading
@@ -678,8 +798,9 @@ function Problems() {
     </div>
   );
 }
-function ProblemPage({ slug, user }) {
+function ProblemPage({ slug, user, contestSlug = null }) {
   const [problem, setProblem] = useState(null);
+  const [contest, setContest] = useState(null);
   const [error, setError] = useState("");
   const [code, setCode] = useState("");
   const [file, setFile] = useState(null);
@@ -692,14 +813,26 @@ function ProblemPage({ slug, user }) {
   const [dataFiles, setDataFiles] = useState([]);
   const [solutionSearch, setSolutionSearch] = useState("");
   const [tabLoading, setTabLoading] = useState(false);
-  const draftKey = `itclub-draft:${user?.id || "guest"}:${slug}`;
+  const draftKey = `itclub-draft:${user?.id || "guest"}:${contestSlug || "practice"}:${slug}`;
+  const problemBase = contestSlug
+    ? `/contests/${encodeURIComponent(contestSlug)}/problems/${encodeURIComponent(slug)}`
+    : `/problems/${encodeURIComponent(slug)}`;
   useEffect(() => {
-    request("/problems/" + slug)
-      .then((d) => {
+    setProblem(null);
+    request(problemBase)
+      .then(async (d) => {
         setProblem(d.problem);
-        setCode(localStorage.getItem(draftKey) ?? d.problem.starter ?? "");
+        if (contestSlug) {
+          const contestData = await request(`/contests/${encodeURIComponent(contestSlug)}`);
+          setContest(contestData.contest);
+        } else setContest(null);
+        const storedDraft = localStorage.getItem(draftKey);
+        const starter = d.problem.starter ?? "";
+        const nextCode = storedDraft == null || storedDraft === legacyStarterTemplate(starter) ? starter : storedDraft;
+        setCode(nextCode);
+        if (storedDraft !== nextCode) localStorage.setItem(draftKey, nextCode);
         if (d.problem.kind === "csv") {
-          request(`/problems/${encodeURIComponent(slug)}/data-files`)
+          request(`${problemBase}/data-files`)
             .then((data) => setDataFiles(data.files || []))
             .catch(() => setDataFiles([]));
         } else {
@@ -707,17 +840,17 @@ function ProblemPage({ slug, user }) {
         }
       })
       .catch((e) => setError(e.message));
-  }, [slug]);
+  }, [slug, contestSlug]);
   useEffect(() => {
     if (activeTab !== "my" || !user) return;
     setTabLoading(true);
-    request(`/submissions?slug=${encodeURIComponent(slug)}`)
+    request(`/submissions?slug=${encodeURIComponent(slug)}${contestSlug ? `&contest_slug=${encodeURIComponent(contestSlug)}` : ""}`)
       .then((data) => setMySubmissions(data.submissions || []))
       .catch((err) => setError(err.message))
       .finally(() => setTabLoading(false));
-  }, [activeTab, user, slug, job]);
+  }, [activeTab, user, slug, job, contestSlug]);
   useEffect(() => {
-    if (activeTab !== "solutions" || !problem) return;
+    if (activeTab !== "solutions" || !problem || contestSlug) return;
     setTabLoading(true);
     request(`/problems/${encodeURIComponent(slug)}/${problem.kind === "csv" ? "leaderboard" : "solutions"}`)
       .then((data) => {
@@ -726,7 +859,7 @@ function ProblemPage({ slug, user }) {
       })
       .catch((err) => setError(err.message))
       .finally(() => setTabLoading(false));
-  }, [activeTab, slug, problem?.kind, job]);
+  }, [activeTab, slug, problem?.kind, job, contestSlug]);
   const updateCode = (value) => {
     const next = value ?? "";
     setCode(next);
@@ -759,12 +892,13 @@ function ProblemPage({ slug, user }) {
         if (!file) throw Error("Select a CSV file");
         const fd = new FormData();
         fd.set("slug", slug);
+        if (contestSlug) fd.set("contest_slug", contestSlug);
         fd.set("file", file);
         data = await request("/submissions/csv", { method: "POST", body: fd });
       } else {
         data = await request("/submissions/code", {
           method: "POST",
-          body: JSON.stringify({ slug, code }),
+          body: JSON.stringify({ slug, code, ...(contestSlug ? { contest_slug: contestSlug } : {}) }),
         });
       }
       setJob(data.id);
@@ -780,10 +914,11 @@ function ProblemPage({ slug, user }) {
   return (
     <div className="shell page problem-detail-page">
       <div className="crumbs">
-        <Link to="/problems">AI Arena</Link>
+        <Link to={contestSlug ? `/contests/${encodeURIComponent(contestSlug)}` : "/problems"}>{contestSlug ? contest?.title || "Contest" : "AI Arena"}</Link>
         <ChevronRight size={15} />
         {problem.title}
       </div>
+      {contestSlug && contest?.problems?.length > 0 && <nav className="contest-problem-switcher" aria-label="Contest exercises">{contest.problems.map(item => <Link key={item.slug} className={item.slug === slug ? "active" : ""} to={`/contests/${encodeURIComponent(contestSlug)}/problems/${encodeURIComponent(item.slug)}`} title={item.title}>{item.label}</Link>)}</nav>}
       <section className="problem-workspace">
         <nav className="problem-tabs" aria-label="Problem sections">
         {[
@@ -791,7 +926,7 @@ function ProblemPage({ slug, user }) {
           ["submit", "Submit"],
           ["my", "My submission"],
           ["solutions", problem.kind === "csv" ? "Leaderboard" : "All Solutions"],
-        ].map(([key, label]) => (
+        ].filter(([key]) => !contestSlug || key !== "solutions").map(([key, label]) => (
           <button key={key} className={activeTab === key ? "active" : ""} onClick={() => { setActiveTab(key); setError(""); }}>
             {label}
           </button>
@@ -814,7 +949,7 @@ function ProblemPage({ slug, user }) {
         <article className="description problem-description">
           <div className="problem-description-title">Description</div>
           <div className="panel-body">
-            <div className="markdown-content"><ReactMarkdown remarkPlugins={[remarkGfm]}>{problem.description}</ReactMarkdown></div>
+            <div className="markdown-content"><ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]}>{problem.description}</ReactMarkdown></div>
             {problem.kind === "code" ? (
               <>
                 <h3>Submission format</h3>
@@ -828,7 +963,11 @@ function ProblemPage({ slug, user }) {
                   <pre>{(problem.sample_tests[0]?.args || []).map(plainValue).join("\n") || "(no arguments)"}</pre>
                   <strong>Expected output</strong>
                   <pre>{plainValue(problem.sample_tests[0]?.expected)}</pre>
-                  <a className="btn ghost small" href={`/api/problems/${encodeURIComponent(slug)}/sample-input.txt`} download>Download sample input (.txt)</a>
+                  {contestSlug ? (
+                    <button className="btn ghost small" type="button" onClick={() => downloadProtected(`${problemBase}/sample-input.txt`, `${slug}-sample-input.txt`).catch(error => setError(error.message))}>Download sample input (.txt)</button>
+                  ) : (
+                    <a className="btn ghost small" href={`/api/problems/${encodeURIComponent(slug)}/sample-input.txt`} download>Download sample input (.txt)</a>
+                  )}
                 </div>
               </>
             ) : (
@@ -851,7 +990,11 @@ function ProblemPage({ slug, user }) {
                   {dataFiles.length ? (
                     <div className="competition-file-list">
                       {dataFiles.map((item) => (
-                        <a key={item.key} className="competition-file" href={`/api/problems/${encodeURIComponent(slug)}/data/${encodeURIComponent(item.key)}`} download>
+                        contestSlug ? <button key={item.key} type="button" className="competition-file" onClick={() => downloadProtected(`${problemBase}/data/${encodeURIComponent(item.key)}`, `${slug}-${item.name}`).catch(error => setError(error.message))}>
+                          <FileSpreadsheet size={20} />
+                          <span><b>{item.label}</b><small>{item.name} · {formatBytes(item.size)}</small></span>
+                          <Download size={17} />
+                        </button> : <a key={item.key} className="competition-file" href={`/api/problems/${encodeURIComponent(slug)}/data/${encodeURIComponent(item.key)}`} download>
                           <FileSpreadsheet size={20} />
                           <span><b>{item.label}</b><small>{item.name} · {formatBytes(item.size)}</small></span>
                           <Download size={17} />
@@ -908,11 +1051,11 @@ function ProblemPage({ slug, user }) {
             ) : (
               <button
                 onClick={send}
-                disabled={submitting}
+                disabled={submitting || (contest && (contest.status !== "open" || new Date(contest.end_at) <= new Date()))}
                 className="btn primary"
               >
                 <Play size={17} />
-                {submitting ? "Submitting..." : "Submit for grading"}
+                {contest && (contest.status !== "open" || new Date(contest.end_at) <= new Date()) ? "Contest ended" : submitting ? "Submitting..." : "Submit for grading"}
               </button>
             )}
           </div>
@@ -939,7 +1082,7 @@ function ProblemPage({ slug, user }) {
                   <tr key={submission.id}>
                     <td><span className={`status ${submission.status}`}>{submission.status}</span></td>
                     <td>{submission.passed}/{submission.total}</td>
-                    <td>{submission.score == null ? "—" : Number(submission.score).toFixed(4)}</td>
+                    <td>{problem.kind === "csv" ? <AiTrackScore submission={submission} /> : submissionScore(submission)}</td>
                     <td>{new Date(submission.created_at).toLocaleString()}</td>
                     <td><Link to={`/submissions/${submission.id}`}>Details <ChevronRight size={15} /></Link></td>
                   </tr>
@@ -956,9 +1099,7 @@ function ProblemPage({ slug, user }) {
           <div className="solutions-toolbar">
             <div>
               <h3>{problem.kind === "csv" ? "Challenge leaderboard" : "All submissions"}</h3>
-              <p>{problem.kind === "csv"
-                ? `${metricLabel(leaderboard?.metric || problem.metric)} · ${leaderboard?.greater_is_better ? "Higher is better" : "Lower is better"}`
-                : "Submission history from club members."}</p>
+                  {problem.kind !== "csv" && <p>Submission history from club members.</p>}
             </div>
             <label className="solutions-search">
               <Search size={16} />
@@ -975,18 +1116,19 @@ function ProblemPage({ slug, user }) {
                         <span className="challenge-medal">{entry.rank === 1 ? "🥇" : entry.rank === 2 ? "🥈" : "🥉"}</span>
                         <UserAvatar user={entry} className="challenge-podium-avatar" />
                         <b>{entry.username}</b>
-                        <strong title={String(entry.score)}>{metricScore(entry.score)}</strong>
+                        <AiTrackScore submission={entry} metric={leaderboard?.metric} prominent />
                       </Link>
                     ))}
                   </div>
                 )}
                 <div className="table-wrap">
                   <table className="solutions-table challenge-leaderboard-table">
-                    <thead><tr><th>Rank</th><th>Participant</th><th>Best score</th><th>Attempts</th><th>Achieved at</th></tr></thead>
+                    <thead><tr><th>Rank</th><th>Participant</th><th>Normalized score</th><th>Raw metric</th><th>Attempts</th><th>Achieved at</th></tr></thead>
                     <tbody>{visibleLeaderboard.map((entry) => (
                       <tr key={entry.best_submission_id} className={entry.username === user?.username ? "current-participant" : ""}>
                         <td className="leaderboard-rank">#{entry.rank}</td>
                         <td><Link className="solution-user" to={`/profile/${encodeURIComponent(entry.username)}`}><UserAvatar user={entry} className="solution-avatar" /><b>{entry.username}</b>{entry.username === user?.username && <span className="you-badge">You</span>}</Link></td>
+                        <td><span className="normalized-table-score">{normalizedScore(entry.normalized_score)}</span></td>
                         <td><b title={String(entry.score)}>{metricScore(entry.score)}</b> <small>{metricLabel(leaderboard?.metric)}</small></td>
                         <td>{entry.attempts}</td>
                         <td>{new Date(entry.achieved_at).toLocaleString()}</td>
@@ -1155,7 +1297,9 @@ function SubmissionDetail({ id, user }) {
               <span>/{sub.total}</span>
             </div>
             <div className="divider" />
-            {sub.score != null && (
+            {sub.kind === "csv" && sub.score != null ? (
+              <AiTrackScore submission={sub} prominent />
+            ) : sub.score != null && (
               <>
                 <span className="stat-label">{sub.metric}</span>
                 <div className="big-stat">{Number(sub.score).toFixed(5)}</div>
@@ -1164,7 +1308,7 @@ function SubmissionDetail({ id, user }) {
             {sub.error && <p className="error-msg">{sub.error}</p>}
             <Link
               className="btn primary wide"
-              to={"/problems/" + sub.problem_slug}
+              to={sub.contest_slug ? `/contests/${encodeURIComponent(sub.contest_slug)}/problems/${encodeURIComponent(sub.problem_slug)}` : "/problems/" + sub.problem_slug}
             >
               Try again
             </Link>
@@ -1220,7 +1364,7 @@ function Submissions({ user }) {
                   </Link>
                 </td>
                 <td>{s.problem_category || (s.kind === "csv" ? "AI Track" : "Function Only")}</td>
-                <td><b>{submissionScore(s)}</b></td>
+                <td>{s.kind === "csv" ? <AiTrackScore submission={s} /> : <b>{submissionScore(s)}</b>}</td>
                 <td>{new Date(s.created_at).toLocaleString()}</td>
                 <td>
                   <Link to={"/submissions/" + s.id}>
@@ -1249,7 +1393,7 @@ function Ranklist() {
       .then((data) => setUsers(data.users || []))
       .catch((err) => setError(err.message));
   }, []);
-  // The API ranks distinct solved problems first and total attempts second.
+  // The API ranks distinct solved problems first and attempts through the first AC second.
   const podiumOrder = [1, 0, 2].filter((index) => index < users.length);
   const medals = ["🥇", "🥈", "🥉"];
   const places = ["1st place", "2nd place", "3rd place"];
@@ -1266,7 +1410,7 @@ function Ranklist() {
                 <UserAvatar user={user} className="rank-avatar" />
                 <div className="rank-place">{places[index]}</div>
                 <Link className="rank-name" to={`/profile/${encodeURIComponent(user.username)}`}>{user.username}</Link>
-                <div className="rank-score"><b>{user.solved}</b><span>Function Only solved</span></div>
+                <div className="rank-score"><b>{user.solved}</b><span>Solved</span></div>
                 <div className="rank-attempts">{user.attempts} attempts</div>
                 <div className="rank-stand" aria-hidden="true">{index + 1}</div>
               </article>
@@ -1276,7 +1420,7 @@ function Ranklist() {
       )}
       <div className="panel table-wrap">
         <table>
-          <thead><tr><th>Rank</th><th>User</th><th>Function Only solved</th><th>Attempts</th></tr></thead>
+          <thead><tr><th>Rank</th><th>User</th><th>Solved</th><th>Attempts</th></tr></thead>
           <tbody>
             {users.map((user, index) => (
               <tr key={user.username} className={index < 3 ? `rank-row rank-row-${index + 1}` : undefined}>
@@ -1293,22 +1437,213 @@ function Ranklist() {
     </div>
   );
 }
-function Contests() {
+function contestTypeLabel(type) {
+  return type === "csv" ? "AI Tracks · Team accounts" : "Function Code · Personal accounts";
+}
+function contestStartLabel(contest) {
+  if (!contest.start_at) return "Not started";
+  return new Date(contest.start_at).toLocaleString([], { year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+}
+function contestElapsed(seconds) {
+  if (seconds == null) return "";
+  const value = Math.max(0, Number(seconds) || 0);
+  const hours = Math.floor(value / 3600);
+  const minutes = Math.floor((value % 3600) / 60);
+  const secs = Math.floor(value % 60);
+  return hours ? `${hours}h ${String(minutes).padStart(2, "0")}m` : `${minutes}m ${String(secs).padStart(2, "0")}s`;
+}
+function ContestScoreCell({ value }) {
+  const cell = typeof value === "object" && value ? value : { score: Number(value) || 0, attempts: value == null ? 0 : 1 };
+  const state = cell.first_solve ? "first-solve" : cell.solved ? "solved" : cell.attempts ? "attempted" : "empty";
+  return <div className={`contest-score-cell ${state}`}>{cell.first_solve && <Star size={14} fill="currentColor" />}<strong>{cell.attempts ? normalizedScore(cell.score) : "—"}</strong>{cell.solved ? <small>{contestElapsed(cell.elapsed_seconds)}</small> : cell.attempts ? <small>{cell.attempts} attempt{cell.attempts === 1 ? "" : "s"}</small> : null}</div>;
+}
+function Contests({ user }) {
+  const [contests, setContests] = useState([]);
+  const [error, setError] = useState("");
+  useEffect(() => {
+    request("/contests").then(data => setContests(data.contests || [])).catch(err => setError(err.message));
+  }, [user?.id]);
   return (
-    <div className="shell page">
-      <div className="page-heading">
+    <div className="shell page contests-page">
+      <div className="page-heading contest-page-heading">
         <span className="section-kicker">COMPETITIONS</span>
         <h1>Contests</h1>
-        <p>Scheduled events and competition listings will appear here.</p>
       </div>
-      <div className="panel empty">
-        <Trophy size={35} />
-        <h3>No active contests</h3>
-        <p>
-          Contest scheduling and registration are not included in this release.
-        </p>
-        <Link to="/problems">Practice problems instead</Link>
-      </div>
+      {error && <p className="error-msg">{error}</p>}
+      <section className="panel contest-list-table"><div className="contest-list-head"><span>Contest</span><span>Status</span><span>Start time</span></div>{contests.map(contest => <Link className="contest-list-row" key={contest.slug} to={`/contests/${encodeURIComponent(contest.slug)}`}><strong>{contest.title}</strong><span className={`contest-status ${contest.status}`}>{contest.status}</span><time>{contestStartLabel(contest)}</time><ChevronRight size={18} /></Link>)}{!contests.length && !error && <div className="empty"><Trophy size={35} /><h3>No contests yet</h3><p>New competitions will appear here.</p></div>}</section>
+    </div>
+  );
+}
+
+function ContestDetail({ slug, user }) {
+  const [contest, setContest] = useState(null);
+  const [leaderboard, setLeaderboard] = useState(null);
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState("");
+  const [joining, setJoining] = useState(false);
+  const load = async () => {
+    try {
+      const data = await request(`/contests/${encodeURIComponent(slug)}`);
+      setContest(data.contest); setError("");
+      if ((data.contest.status === "open" && data.contest.can_access) || data.contest.status === "ended") {
+        const board = await request(`/contests/${encodeURIComponent(slug)}/leaderboard`);
+        setLeaderboard(board);
+      } else setLeaderboard(null);
+    } catch (err) { setError(err.message); }
+  };
+  useEffect(() => { load(); }, [slug, user?.id]);
+  useEffect(() => {
+    if (contest?.status !== "open") return undefined;
+    const timer = setInterval(load, 15000);
+    return () => clearInterval(timer);
+  }, [contest?.status, slug, user?.id]);
+  const join = async (event) => {
+    event.preventDefault(); setJoining(true); setError("");
+    try { await request(`/contests/${encodeURIComponent(slug)}/join`, { method: "POST", body: JSON.stringify({ password }) }); setPassword(""); await load(); }
+    catch (err) { setError(err.message); }
+    finally { setJoining(false); }
+  };
+  if (error && !contest) return <div className="shell page error-msg">{error}</div>;
+  if (!contest) return <div className="shell page">Loading contest...</div>;
+  const wrongRole = user && user.role !== "admin" && ((contest.type === "csv" && user.role !== "team") || (contest.type === "code" && user.role !== "student"));
+  return (
+    <div className="shell page contest-detail-page">
+      <div className="crumbs"><Link to="/contests">Contests</Link><ChevronRight size={15} />{contest.title}</div>
+      {error && <p className="error-msg">{error}</p>}
+      {contest.status === "closed" && (
+        <section className="panel contest-waiting-notice" role="status">
+          <span><Clock3 size={26} /></span>
+          <div>
+            <h2>Contest chưa mở</h2>
+            <p>Vui lòng chờ ban tổ chức mở contest trước khi vào thi.</p>
+          </div>
+        </section>
+      )}
+      {contest.status === "open" && !contest.can_access && (
+        <section className="panel contest-join-panel">
+          <h2>Enter contest</h2>
+          {!user ? <><p>Sign in with the account provided for this contest.</p><Link className="btn primary" to="/login">Sign in</Link></> : wrongRole ? <p className="error-msg">{contest.type === "csv" ? "This AI Tracks contest requires a team account supplied by the organizers." : "This Function Code contest requires a personal student account."}</p> : (
+            <form onSubmit={join}><label>Contest password<input type="password" required value={password} onChange={event => setPassword(event.target.value)} placeholder="Password from the organizers" /></label><button className="btn primary" disabled={joining}>{joining ? "Checking..." : "Join contest"}</button></form>
+          )}
+        </section>
+      )}
+      {contest.status !== "closed" && contest.can_access && contest.problems.length > 0 && (
+        <Link className="panel contest-exam-launch" to={contest.problems[0] ? `/contests/${encodeURIComponent(slug)}/problems/${encodeURIComponent(contest.problems[0].slug)}` : "#"}><span className="contest-exam-icon"><Play size={25} fill="currentColor" /></span><div><span className="section-kicker">CONTEST WORKSPACE</span><h2>{contest.status === "ended" ? "Review the exam" : "Start the exam"}</h2></div><span className="contest-exam-problems">{contest.problems.map(problem => <i key={problem.slug}>{problem.label}</i>)}</span><ChevronRight size={23} /></Link>
+      )}
+      {contest.status !== "closed" && (contest.can_access || contest.status === "ended") && leaderboard && (
+        <section className="panel contest-leaderboard">
+          <div className="panel-head"><Trophy size={19} /> Contest leaderboard {contest.status === "ended" && <span className="editor-badge">FINAL</span>}</div>
+          <div className="table-wrap"><table><thead><tr><th>Rank</th><th>Participant</th>{leaderboard.problems.map(problem => <th key={problem.problem_slug}>{problem.label}</th>)}<th>Total</th><th>Attempts</th></tr></thead>
+            <tbody>{leaderboard.entries.map(entry => <tr key={entry.username} className={entry.username === user?.username ? "current-participant" : ""}><td><b>#{entry.rank}</b></td><td><Link className="solution-user" to={`/profile/${encodeURIComponent(entry.username)}`}><UserAvatar user={entry} className="solution-avatar" /><b>{entry.username}</b></Link></td>{leaderboard.problems.map(problem => <td key={problem.problem_slug}><ContestScoreCell value={entry.scores[problem.label]} /></td>)}<td className="contest-total">{normalizedScore(entry.total)}</td><td>{entry.attempts}</td></tr>)}</tbody>
+          </table>{!leaderboard.entries.length && <p className="empty">No ranked submissions yet.</p>}</div>
+        </section>
+      )}
+    </div>
+  );
+}
+
+const emptyContest = { title: "", type: "code", duration_minutes: 60, password: "", problem_slugs: [] };
+function AdminSectionNav() {
+  return <nav className="admin-section-nav" aria-label="Administration sections"><NavLink to="/admin/problems"><Layers3 size={16} /><span>Exercises</span></NavLink><NavLink to="/admin/contests"><Trophy size={16} /><span>Contests & teams</span></NavLink></nav>;
+}
+function AdminContests({ user }) {
+  const navigate = useNavigate();
+  const [contests, setContests] = useState([]);
+  const [problems, setProblems] = useState([]);
+  const [teams, setTeams] = useState([]);
+  const [editing, setEditing] = useState(null);
+  const [model, setModel] = useState(emptyContest);
+  const [team, setTeam] = useState({ username: "", password: "" });
+  const [error, setError] = useState("");
+  const [success, setSuccess] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [deleteTarget, setDeleteTarget] = useState(null);
+  const [deleteConfirmation, setDeleteConfirmation] = useState("");
+  const load = async () => {
+    try {
+      const [contestData, problemData, teamData] = await Promise.all([request("/admin/contests"), request("/admin/problems"), request("/admin/team-accounts")]);
+      setContests(contestData.contests || []); setProblems(problemData.problems || []); setTeams(teamData.accounts || []);
+    } catch (err) { setError(err.message); }
+  };
+  useEffect(() => { if (user?.role === "admin") load(); }, [user?.role]);
+  const start = contest => {
+    setEditing(contest?.slug || null); setError(""); setSuccess("");
+    setModel(contest ? { title: contest.title, type: contest.type, duration_minutes: contest.duration_minutes, password: "", problem_slugs: (contest.problems || []).map(problem => problem.problem_slug) } : emptyContest);
+    requestAnimationFrame(() => document.getElementById("contest-editor")?.scrollIntoView({ behavior: "smooth", block: "start" }));
+  };
+  const change = (key, value) => setModel(current => ({ ...current, [key]: value }));
+  const save = async event => {
+    event.preventDefault(); setBusy(true); setError(""); setSuccess("");
+    try {
+      const result = await request(`/admin/contests${editing ? `/${encodeURIComponent(editing)}` : ""}`, { method: editing ? "PUT" : "POST", body: JSON.stringify(model) });
+      if (!editing) {
+        navigate(`/admin/problems?contest=${encodeURIComponent(result.slug)}`);
+        return;
+      }
+      setSuccess("Contest updated."); setEditing(null); setModel(emptyContest); await load();
+    } catch (err) { setError(err.message); }
+    finally { setBusy(false); }
+  };
+  const action = async (slug, name) => {
+    if (!window.confirm(name === "open" ? "Open this contest now? The countdown starts immediately." : "End this contest now? New submissions will be blocked.")) return;
+    setError(""); setSuccess("");
+    try { await request(`/admin/contests/${encodeURIComponent(slug)}/${name}`, { method: "POST" }); setSuccess(name === "open" ? "Contest is now open." : "Contest ended and its final leaderboard is public."); await load(); }
+    catch (err) { setError(err.message); }
+  };
+  const removeExercise = async problemSlug => {
+    if (!editing || !window.confirm(`Delete ${problemTitle(problemSlug)} from this contest? Its submissions and uploaded files will also be deleted.`)) return;
+    setBusy(true); setError(""); setSuccess("");
+    try {
+      const result = await request(`/admin/contests/${encodeURIComponent(editing)}/problems/${encodeURIComponent(problemSlug)}`, { method: "DELETE", body: JSON.stringify({ confirm_slug: problemSlug }) });
+      setModel(current => ({ ...current, problem_slugs: current.problem_slugs.filter(slug => slug !== problemSlug) }));
+      setSuccess(`Exercise deleted with ${result.deleted_submissions} submission(s).`);
+      await load();
+    } catch (err) { setError(err.message); }
+    finally { setBusy(false); }
+  };
+  const openContestDelete = contest => {
+    setDeleteTarget(contest);
+    setDeleteConfirmation("");
+    setError("");
+  };
+  const permanentlyDeleteContest = async () => {
+    if (!deleteTarget || deleteConfirmation !== deleteTarget.slug) return;
+    setBusy(true); setError(""); setSuccess("");
+    try {
+      const result = await request(`/admin/contests/${encodeURIComponent(deleteTarget.slug)}`, {
+        method: "DELETE",
+        body: JSON.stringify({ confirm_slug: deleteConfirmation }),
+      });
+      if (editing === deleteTarget.slug) start(null);
+      setSuccess(`Contest deleted. ${result.retained_problems} exercise(s) and ${result.retained_submissions} submission(s) were retained.`);
+      setDeleteTarget(null); setDeleteConfirmation("");
+      await load();
+    } catch (err) { setError(err.message); }
+    finally { setBusy(false); }
+  };
+  const createTeam = async event => {
+    event.preventDefault(); setBusy(true); setError(""); setSuccess("");
+    try { await request("/admin/team-accounts", { method: "POST", body: JSON.stringify(team) }); setSuccess(`Team account ${team.username} created. Save the password and provide it to the team.`); setTeam({ username: "", password: "" }); await load(); }
+    catch (err) { setError(err.message); }
+    finally { setBusy(false); }
+  };
+  if (!user) return <div className="shell page"><h1>Administrator sign-in required</h1><Link className="btn primary" to="/login">Login</Link></div>;
+  if (user.role !== "admin") return <div className="shell page"><h1>Access restricted</h1><p>Only administrators can manage contests.</p></div>;
+  const editingContest = contests.find(contest => contest.slug === editing);
+  const problemTitle = slug => problems.find(problem => problem.slug === slug)?.title || slug;
+  return (
+    <div className="shell page admin-page contest-admin-page">
+      <AdminSectionNav />
+      <div className="page-heading"><span className="section-kicker">ADMINISTRATION</span><h1>Contest management</h1></div>
+      {error && <p className="error-msg">{error}</p>}{success && <p className="admin-success">{success}</p>}
+      <section className="panel contest-list-panel"><div className="panel-head"><Trophy size={18} /> Contests</div><div className="admin-list">{contests.map(contest => <div className="admin-item contest-admin-item" key={contest.slug}><div><b>{contest.title} <span className={`contest-status ${contest.status}`}>{contest.status}</span></b><small>{contestTypeLabel(contest.type)} · {contest.problem_count} problems · {contest.duration_minutes} minutes</small></div><div className="admin-actions">{contest.status === "closed" && <><button className="btn ghost small" onClick={() => start(contest)}>Edit</button><Link className="btn ghost small" to={`/admin/problems?contest=${encodeURIComponent(contest.slug)}`}>Manage exercises</Link><button className="btn primary small" onClick={() => action(contest.slug, "open")}>Open</button><button className="btn danger small" onClick={() => openContestDelete(contest)}><Trash2 size={14} /> Delete</button></>}{contest.status === "open" && <><Link className="btn ghost small" to={`/contests/${encodeURIComponent(contest.slug)}`}>View</Link><button className="btn danger small" onClick={() => action(contest.slug, "end")}>End now</button></>}{contest.status === "ended" && <><Link className="btn ghost small" to={`/contests/${encodeURIComponent(contest.slug)}`}>Results</Link><button className="btn danger small" onClick={() => openContestDelete(contest)}><Trash2 size={14} /> Delete</button></>}</div></div>)}{!contests.length && <p className="empty">No contests have been created.</p>}</div></section>
+      <section id="contest-editor" className="panel admin-editor contest-editor-panel"><div className="panel-head"><Clock3 size={18} /> {editing ? "Edit closed contest" : "Create contest"}</div><form className="admin-form contest-form" onSubmit={save}>
+          <div className="contest-form-fields"><label className="contest-title-field">Contest title<input required value={model.title} onChange={event => change("title", event.target.value)} placeholder="ITClub Weekly Contest #1" /></label><label>Contest type<select value={model.type} onChange={event => setModel(current => ({ ...current, type: event.target.value, problem_slugs: [] }))}><option value="code">Function Code · personal accounts</option><option value="csv">AI Tracks · team accounts</option></select></label><label>Duration (minutes)<input type="number" min="5" max="10080" required value={model.duration_minutes} onChange={event => change("duration_minutes", event.target.value)} /></label><label>Contest password<input type="password" required={!editing} value={model.password} onChange={event => change("password", event.target.value)} placeholder={editing ? "Leave blank to keep current password" : "Password supplied to participants"} /></label></div>
+          {editing && <div className="contest-exercise-flow"><div><b>Contest exercises</b><small>Private until the contest ends.</small></div><div className="contest-attached-list">{(editingContest?.problems || []).map(problem => <span key={problem.problem_slug}><b>{problem.label}</b><strong>{problemTitle(problem.problem_slug)}</strong><button type="button" className="btn danger small" disabled={busy} onClick={() => removeExercise(problem.problem_slug)}><Trash2 size={14} /> Delete</button></span>)}{!editingContest?.problems?.length && <span className="empty">No exercises added yet.</span>}</div><Link className="btn ghost small contest-add-exercise" to={`/admin/problems?contest=${encodeURIComponent(editing)}`}>Create or import exercises</Link></div>}
+          <div className="form-actions compact-actions"><button className="btn primary small" disabled={busy}>{busy ? "Saving..." : editing ? "Update contest" : "Create & add exercises"}</button>{editing && <button type="button" className="btn ghost small" onClick={() => start(null)}>Cancel</button>}</div>
+        </form></section>
+      <section className="panel team-account-panel"><div className="panel-head"><UserRound size={18} /> AI Tracks team accounts</div><div className="team-account-layout"><form className="admin-form team-account-create" onSubmit={createTeam}><label>Team username<input required pattern="[a-zA-Z0-9_]{3,40}" value={team.username} onChange={event => setTeam(current => ({ ...current, username: event.target.value }))} placeholder="team_alpha" /></label><label>Initial password<input required minLength="10" type="password" value={team.password} onChange={event => setTeam(current => ({ ...current, password: event.target.value }))} placeholder="At least 10 characters" /></label><button className="btn primary" disabled={busy}>Create team account</button></form><div className="table-wrap team-account-list"><table><thead><tr><th>Team</th><th>Created</th></tr></thead><tbody>{teams.map(account => <tr key={account.id}><td><b>{account.username}</b></td><td>{new Date(account.created_at).toLocaleString()}</td></tr>)}</tbody></table>{!teams.length && <p className="empty">No team accounts yet.</p>}</div></div></section>
+      {deleteTarget && <div className="confirm-overlay" role="presentation" onMouseDown={event => { if (event.target === event.currentTarget && !busy) setDeleteTarget(null); }}><section className="confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="delete-contest-title"><span className="confirm-danger-icon"><Trash2 size={24} /></span><h2 id="delete-contest-title">Delete contest permanently?</h2><p>The contest, participant access and leaderboard will be removed. Exercises and submission history will be retained.</p><div className="delete-impact"><span><b>{deleteTarget.problem_count || 0}</b> exercises kept</span><span><b>{deleteTarget.participant_count || 0}</b> participants removed</span><span><b>{deleteTarget.submission_count || 0}</b> submissions kept</span></div><label>Type <code>{deleteTarget.slug}</code> to confirm<input autoFocus value={deleteConfirmation} onChange={event => setDeleteConfirmation(event.target.value)} /></label><div className="confirm-actions"><button className="btn ghost" type="button" disabled={busy} onClick={() => setDeleteTarget(null)}>Cancel</button><button className="btn danger" type="button" disabled={busy || deleteConfirmation !== deleteTarget.slug} onClick={permanentlyDeleteContest}>{busy ? "Deleting..." : "Delete contest"}</button></div></section></div>}
     </div>
   );
 }
@@ -1321,6 +1656,7 @@ const defaultCsvConfig = {
   task_type: "binary_probability",
   metric: "log_loss",
   greater_is_better: false,
+  baseline_score: 0.5,
   allow_extra_columns: false,
 };
 const competitionUploadFields = [
@@ -1347,6 +1683,9 @@ const emptyAdmin = {
   config: JSON.stringify(defaultCsvConfig, null, 2),
 };
 function AdminProblems({ user }) {
+  const location = useLocation();
+  const contestTarget = new URLSearchParams(location.search).get("contest");
+  const [targetContest, setTargetContest] = useState(null);
   const [items, setItems] = useState([]),
     [editing, setEditing] = useState(null),
     [model, setModel] = useState(emptyAdmin),
@@ -1370,6 +1709,17 @@ function AdminProblems({ user }) {
   useEffect(() => {
     if (user?.role === "admin") load();
   }, [user?.role]);
+  useEffect(() => {
+    if (!contestTarget || user?.role !== "admin") return;
+    request("/admin/contests")
+      .then(data => {
+        const contest = (data.contests || []).find(item => item.slug === contestTarget);
+        if (!contest || contest.status !== "closed") throw Error("The target contest is missing or is no longer closed.");
+        setTargetContest(contest);
+        setModel(current => ({ ...current, kind: contest.type }));
+      })
+      .catch(err => setError(err.message));
+  }, [contestTarget, user?.role]);
   const start = (problem) => {
     setEditing(problem?.slug || null);
     setTruth(null);
@@ -1385,7 +1735,7 @@ function AdminProblems({ user }) {
             tests: displayTests(problem.tests),
             config: JSON.stringify(problem.config || defaultCsvConfig, null, 2),
           }
-        : emptyAdmin,
+        : { ...emptyAdmin, kind: targetContest?.type || "code" },
     );
   };
   const change = (key, value) => setModel((m) => ({ ...m, [key]: value }));
@@ -1395,6 +1745,7 @@ function AdminProblems({ user }) {
     setError(""); setSuccess(""); setImporting(true);
     try {
       const body=new FormData(); body.set("file",importFile);
+      if (contestTarget) body.set("contest_slug", contestTarget);
       const result=await request("/admin/problems/import-csv",{method:"POST",body});
       setSuccess(`Imported ${result.imported} exercises (${result.tests} test cases).`);
       setImportFile(null); await load();
@@ -1405,6 +1756,11 @@ function AdminProblems({ user }) {
     try {
       const token=localStorage.getItem("token");
       const response=await fetch("/api/admin/problems/import-template.csv",{headers:{Authorization:`Bearer ${token}`}});
+      if(response.status===401 && token) {
+        clearStoredSession(AUTH_EXPIRED_MESSAGE);
+        window.location.replace("/login");
+        throw Error(AUTH_EXPIRED_MESSAGE);
+      }
       if(!response.ok) throw Error("Template download failed");
       const blob=await response.blob(); const url=URL.createObjectURL(blob);
       const a=document.createElement("a"); a.href=url; a.download="python-problems-template.csv"; a.click();
@@ -1434,6 +1790,7 @@ function AdminProblems({ user }) {
       ])
         body.set(key, model[key] || "");
       if (model.kind === "code") body.set("tests", JSON.stringify(model.tests));
+      if (contestTarget && !editing) body.set("contest_slug", contestTarget);
       if (truth) body.set("ground_truth", truth);
       if (sample) body.set("sample_submission", sample);
       for (const [key, file] of Object.entries(datasetUploads)) if (file) body.set(key, file);
@@ -1445,10 +1802,12 @@ function AdminProblems({ user }) {
       setSuccess(
         editing
           ? "Exercise updated successfully."
-          : "Exercise created successfully.",
+          : contestTarget
+            ? "Private exercise created and attached to the closed contest."
+            : "Exercise created successfully.",
       );
       setEditing(null);
-      setModel(emptyAdmin);
+      setModel({ ...emptyAdmin, kind: targetContest?.type || "code" });
       setTruth(null);
       setSample(null);
       setDatasetUploads({ train_data: null, test_data: null, data_bundle: null });
@@ -1526,16 +1885,19 @@ function AdminProblems({ user }) {
       </div>
     );
   return (
-    <div className="shell page admin-page">
+    <div className={`shell page admin-page${contestTarget ? " private-exercise-mode" : ""}`}>
+      <AdminSectionNav />
       <div className="page-heading">
         <span className="section-kicker">ADMINISTRATION</span>
-        <h1>Exercise management</h1>
+        <h1>{contestTarget ? "Add private contest exercise" : "Exercise management"}</h1>
         <p>
-          Create and update Python coding exercises or CSV-based AI assessments.
+          {contestTarget ? "This exercise will be attached directly to the closed contest and hidden from AI Arena until the contest ends." : "Create and update Python coding exercises or CSV-based AI assessments."}
         </p>
       </div>
+      {contestTarget && <div className="private-contest-banner"><ShieldCheck size={18} /><span>Private for contest <b>{targetContest?.title || contestTarget}</b></span><Link className="btn ghost small" to="/admin/contests">Back to contests</Link></div>}
       {error && <p className="error-msg">{error}</p>}
       {success && <p className="admin-success">{success}</p>}
+      {!contestTarget && <>
       <section className="panel admin-csv-examples" aria-label="CSV examples for problem authors">
         <div className="panel-head"><FileSpreadsheet size={18} /> Example CSV inputs and outputs</div>
         <div className="admin-csv-examples-body">
@@ -1564,17 +1926,18 @@ function AdminProblems({ user }) {
           </div>
         </div>
       </section>
-      <section className="panel bulk-import">
+      </>}
+      {(!contestTarget || targetContest?.type === "code") && <section className="panel bulk-import">
         <div className="panel-head"><Upload size={18}/> Bulk import Python exercises (CSV)</div>
         <div className="bulk-import-body">
-          <p>Import many exercises at once. Repeat the slug in multiple rows to add test cases.</p>
+          <p>{contestTarget ? "Import multiple private Function Code exercises into this contest. Repeat a slug on multiple rows to add test cases." : "Import many exercises at once. Repeat the slug in multiple rows to add test cases."}</p>
           <button type="button" className="btn ghost small" onClick={downloadTemplate}>Download CSV template</button>
           <input aria-label="Python problems CSV" type="file" accept=".csv,text/csv" onChange={e => setImportFile(e.target.files?.[0] || null)}/>
           <button type="button" className="btn primary small" disabled={!importFile || importing} onClick={uploadBatch}>{importing ? "Importing..." : "Import exercises"}</button>
         </div>
-      </section>
-      <div className="admin-layout">
-        <section className="panel">
+      </section>}
+      <div className={`admin-layout${contestTarget ? " private-layout" : ""}`}>
+        {!contestTarget && <section className="panel">
           <div className="panel-head">
             <Layers3 size={18} /> Published exercises{" "}
             <span className="editor-badge">
@@ -1625,7 +1988,7 @@ function AdminProblems({ user }) {
               Create new exercise
             </button>
           </div>
-        </section>
+        </section>}
         <section className="panel admin-editor">
           <div className="panel-head">
             <Code2 size={18} />
@@ -1678,7 +2041,7 @@ function AdminProblems({ user }) {
             <label>
               Exercise type
               <select
-                disabled={!!editing}
+                disabled={!!editing || !!contestTarget}
                 value={model.kind}
                 onChange={(e) => change("kind", e.target.value)}
               >
@@ -1741,8 +2104,8 @@ function AdminProblems({ user }) {
                     onChange={(e) => change("config", e.target.value)}
                   />
                   <small>
-                    Example metrics: log_loss, accuracy, rmse, micro_f1,
-                    ndcg_at_k, sacrebleu. Column names must match CSV headers.
+                     Example metrics: log_loss, accuracy, rmse, micro_f1,
+                     ndcg_at_k, sacrebleu. Add baseline_score using the score measured from the provided baseline; the perfect score is derived automatically.
                   </small>
                 </label>
                 <label>

@@ -268,6 +268,57 @@ class MulticlassProbabilityAdapter(TaskAdapter):
         )
 
 
+class MulticlassLabelAdapter(TaskAdapter):
+    name = "multiclass_label"
+
+    def validate_config(self, config: ProblemConfig) -> None:
+        if len(config.prediction_columns) != 1:
+            raise ValueError(
+                "multiclass_label requires exactly one prediction column"
+            )
+
+    def prepare(self, truth, submission, config) -> PreparedData:
+        _validate_schema_and_ids(truth, submission, config)
+        prediction_column = config.prediction_columns[0]
+        targets = truth[config.target_column].astype("string")
+        predictions = submission[prediction_column].astype("string")
+
+        if targets.str.strip().eq("").any():
+            raise JudgeInternalError(
+                "INVALID_GROUND_TRUTH",
+                "Multiclass ground truth contains empty labels",
+            )
+        empty_predictions = predictions.str.strip().eq("")
+        if empty_predictions.any():
+            raise SubmissionError(
+                "EMPTY_LABEL",
+                f"Column '{prediction_column}' contains empty labels",
+                _examples(submission.loc[empty_predictions, config.id_column]),
+            )
+
+        known_labels = set(targets.tolist())
+        unknown_predictions = ~predictions.isin(known_labels)
+        if unknown_predictions.any():
+            raise SubmissionError(
+                "UNKNOWN_LABEL",
+                "Submission contains labels that do not exist in ground truth",
+                _examples(predictions.loc[unknown_predictions]),
+            )
+
+        prediction_frame = predictions.to_frame(name=prediction_column)
+        aligned = _align(
+            truth,
+            submission,
+            config,
+            targets,
+            prediction_frame,
+        )
+        return PreparedData(
+            aligned[config.target_column].astype("string"),
+            aligned[prediction_column].astype("string"),
+        )
+
+
 class TextGenerationAdapter(TaskAdapter):
     name = "text_generation"
 
@@ -464,6 +515,7 @@ TASK_ADAPTERS: dict[str, TaskAdapter] = {
         RegressionAdapter(),
         BinaryProbabilityAdapter(),
         MulticlassProbabilityAdapter(),
+        MulticlassLabelAdapter(),
         TextGenerationAdapter(),
         MultilabelProbabilityAdapter(),
         RankingAdapter(),

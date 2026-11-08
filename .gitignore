@@ -5,3 +5,7 @@
 **/__pycache__/
 *.pyc
 .DS_Store
+
+# Local planning notes and private contest material
+DEVELOPMENT_PLAN.md
+contest-packages/

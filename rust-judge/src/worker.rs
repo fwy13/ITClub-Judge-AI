@@ -52,6 +52,32 @@ async fn execute(State(state):State<Arc<StateData>>,Json(req):Json<SubmitRequest
 fn identifier(s:&str)->bool{let mut it=s.chars();it.next().is_some_and(|x|x=='_'||x.is_ascii_alphabetic())&&it.all(|x|x=='_'||x.is_ascii_alphanumeric())}
 fn internal<E:std::fmt::Display>(_e:E)->(StatusCode,Json<Value>){(StatusCode::INTERNAL_SERVER_ERROR,Json(json!({"error":"worker internal error"})))}
 
+// Function-only exercises frequently return floating-point scalars or nested
+// NumPy/PyTorch values. Comparing their JSON representation byte-for-byte
+// rejects mathematically correct solutions that differ only by normal
+// floating-point rounding, so numeric leaves use the same tolerance at every
+// nesting level while strings, booleans and object keys remain exact.
+fn values_match(expected:&Value, actual:&Value)->bool {
+    match (expected,actual) {
+        (Value::Number(left),Value::Number(right)) => {
+            match (left.as_f64(),right.as_f64()) {
+                (Some(left_value),Some(right_value)) if left_value.is_finite()&&right_value.is_finite() => {
+                    let both_integers=(left.is_i64()||left.is_u64())&&(right.is_i64()||right.is_u64());
+                    if both_integers {left==right}
+                    else if left.is_i64()||left.is_u64()||right.is_i64()||right.is_u64() {(left_value-right_value).abs()<=1e-9}
+                    else {(left_value-right_value).abs() <= 1e-6 + 1e-5*left_value.abs()}
+                },
+                _ => left==right,
+            }
+        }
+        (Value::Array(left),Value::Array(right)) =>
+            left.len()==right.len()&&left.iter().zip(right).all(|(left,right)|values_match(left,right)),
+        (Value::Object(left),Value::Object(right)) =>
+            left.len()==right.len()&&left.iter().all(|(key,value)|right.get(key).is_some_and(|other|values_match(value,other))),
+        _ => expected==actual,
+    }
+}
+
 async fn run_job(state:&StateData,req:&SubmitRequest,id:u32)->Result<SubmitResponse>{
     let job=tempfile::Builder::new().prefix("oj-").tempdir_in("/tmp")?;
     std::fs::set_permissions(job.path(),std::fs::Permissions::from_mode(0o777))?;
@@ -107,7 +133,7 @@ async fn run_job(state:&StateData,req:&SubmitRequest,id:u32)->Result<SubmitRespo
         let status=if timed_out {"time_limit_exceeded"} else if oom {"memory_limit_exceeded"}
             else if let Some(_)=&error {"runtime_error"}
             else if let Some(value)=&actual {
-                if case.expected.as_ref().is_some_and(|expect|expect!=value){"wrong_answer"}else{"accepted"}
+                if case.expected.as_ref().is_some_and(|expect|!values_match(expect,value)){"wrong_answer"}else{"accepted"}
             }else{"runtime_error"};
         results.push(TestResult {index,status:status.into(),actual,expected:case.expected.clone(),error,stdout});
     }
@@ -127,4 +153,25 @@ fn read_limited(path:&Path,max:u64)->Result<Vec<u8>>{
     f.take(max+1).read_to_end(&mut data)?;
     if data.len() as u64>max{anyhow::bail!("result too large")}
     Ok(data)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::values_match;
+    use serde_json::json;
+
+    #[test]
+    fn numeric_values_allow_small_rounding_error() {
+        assert!(values_match(&json!(0.326928),&json!(0.3269284)));
+        assert!(values_match(&json!([1.0,[0.25,0.75]]),&json!([1,[0.2500001,0.7499999]])));
+        assert!(!values_match(&json!(0.326928),&json!(0.33)));
+        assert!(!values_match(&json!(1_000_000_000),&json!(1_000_000_001)));
+    }
+
+    #[test]
+    fn non_numeric_values_and_shapes_remain_exact() {
+        assert!(values_match(&json!({"label":"AI","ok":true}),&json!({"ok":true,"label":"AI"})));
+        assert!(!values_match(&json!([1,2]),&json!([1,2,3])));
+        assert!(!values_match(&json!("AI"),&json!("ai")));
+    }
 }

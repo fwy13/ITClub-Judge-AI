@@ -92,6 +92,37 @@ def test_rejects_invalid_multiclass_probability_sum(tmp_path):
     assert result.error_code == "INVALID_PROBABILITY_SUM"
 
 
+@pytest.mark.parametrize("metric", ["accuracy", "macro_f1"])
+def test_multiclass_label_metrics(tmp_path, metric):
+    config = base_config("multiclass_label", metric, ["label"])
+    problem = make_problem(
+        tmp_path,
+        config,
+        "id,target\n001,0\n002,1\n003,2\n",
+        "id,label\n003,2\n001,0\n002,1\n",
+    )
+
+    result = judge_submission(problem, problem / "sample_submission.csv")
+
+    assert result.status == "accepted"
+    assert result.score == pytest.approx(1.0)
+
+
+def test_multiclass_label_rejects_unknown_label(tmp_path):
+    config = base_config("multiclass_label", "accuracy", ["label"])
+    problem = make_problem(
+        tmp_path,
+        config,
+        "id,target\n001,cat\n002,dog\n",
+        "id,label\n001,cat\n002,bird\n",
+    )
+
+    result = judge_submission(problem, problem / "sample_submission.csv")
+
+    assert result.status == "rejected"
+    assert result.error_code == "UNKNOWN_LABEL"
+
+
 def test_rejects_non_finite_regression_value(tmp_path):
     config = base_config("regression", "rmse", ["prediction"])
     problem = make_problem(

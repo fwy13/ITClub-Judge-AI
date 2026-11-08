@@ -13,6 +13,9 @@ import { readFile, mkdir, writeFile, rename, rm, copyFile, stat, readdir, statfs
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import {parse as parseCsv} from 'csv-parse/sync';
+import { normalizeMetricScore, perfectScoreForMetric, scoreScale } from './scoring.js';
+import { contestAcceptsSubmissions, contestProblemLabel, effectiveContestStatus, roleCanEnterContest } from './contest-rules.js';
+import { normalizeProblemText, publicStarter } from './problem-rules.js';
 
 const { Pool } = pg;
 const pool = new Pool({ connectionString: process.env.DATABASE_URL, max: 10 });
@@ -28,28 +31,18 @@ const sockets = new Map();
 const queue = []; let active = 0; const MAX_ACTIVE = 2; const MAX_QUEUE = 200;
 const workerUrl = process.env.RUST_WORKER_URL || 'http://rust-worker:3001';
 const csvUrl = process.env.CSV_JUDGE_URL || 'http://csv-judge:8100';
-// Only send the callable signature; never expose a stored reference implementation.
-// Leave `pass` as a placeholder so the code remains a valid Python submission.
-function publicSignature(p) {
-    if (p.kind !== 'code') return '';
-    const source = String(p.starter || '');
-    const escaped = String(p.function || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const pattern = new RegExp('^\\s*(?:async\\s+)?def\\s+' + escaped + '\\s*\\([^\\n]*\\)\\s*(?:->[^:\\n]+)?\\s*:', 'm');
-    const match = source.match(pattern);
-    const declaration = match ? match[0].trim() : `def ${p.function || 'solve'}(*args, **kwargs):`;
-    if (p.class_name) return `class ${p.class_name}:\n    ${declaration}\n        pass`;
-    return `${declaration}\n    pass`;
-}
 const publicProblem = p => ({
     slug: p.slug,
     title: p.title,
     category: p.category,
     difficulty: p.difficulty,
     kind: p.kind,
-    description: p.description,
-    starter: publicSignature(p),
+    description: normalizeProblemText(p.description),
+    starter: publicStarter(p),
     metric: p.metric,
     greater_is_better: p.kind === 'csv' ? Boolean(p.config?.greater_is_better) : null,
+    baseline_score: p.kind === 'csv' ? scoreScale(p)?.baseline ?? null : null,
+    perfect_score: p.kind === 'csv' ? scoreScale(p)?.perfect ?? null : null,
     sample_tests: (p.tests || []).slice(0, 1).map(t => ({ args: t.args, expected: t.expected })),
 });
 const asyncRoute = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
@@ -70,6 +63,11 @@ async function publicProfileFor(username) {
     return q.rows[0] || null;
 }
 function auth(req, res, next) { try { const t = (req.headers.authorization || '').replace(/^Bearer /, ''); req.user = verify(t); next() } catch { res.status(401).json({ error: 'Authentication required' }) } }
+function optionalAuth(req, _res, next) {
+    const token = (req.headers.authorization || '').replace(/^Bearer /, '');
+    if (token) { try { req.user = verify(token); } catch { req.user = null; } }
+    next();
+}
 async function admin(req, res, next) {
     try { const q = await pool.query('SELECT role FROM users WHERE id=$1', [req.user.id]); if (q.rows[0]?.role !== 'admin') return res.status(403).json({ error: 'Administrator access required' }); next() } catch (e) { next(e) }
 }
@@ -77,10 +75,10 @@ function send(socket, payload) { if (socket.readyState === 1) socket.send(JSON.s
 function broadcast(id, event) { for (const ws of sockets.get(id) || []) send(ws, event) }
 function subscribe(ws, id) { let s = sockets.get(id); if (!s) { s = new Set(); sockets.set(id, s) } s.add(ws); ws._subscriptions.add(id) }
 async function getSubmission(id, uid) {
-    const q = await pool.query(`SELECT id,problem_slug,kind,status,passed,total,
-        CASE WHEN kind='code' AND total>0 THEN passed::double precision*100/total ELSE score END AS score,
-        CASE WHEN kind='code' THEN 'AC rate' ELSE metric END AS metric,results,error,created_at
-        FROM submissions WHERE id=$1 AND user_id=$2`, [id, uid]);
+    const q = await pool.query(`SELECT s.id,s.problem_slug,s.kind,s.status,s.passed,s.total,s.normalized_score,
+        CASE WHEN s.kind='code' AND s.total>0 THEN s.passed::double precision*100/s.total ELSE s.score END AS score,
+        CASE WHEN s.kind='code' THEN 'AC rate' ELSE s.metric END AS metric,s.results,s.error,s.created_at,c.slug AS contest_slug
+        FROM submissions s LEFT JOIN contests c ON c.id=s.contest_id WHERE s.id=$1 AND s.user_id=$2`, [id, uid]);
     return q.rows[0] || null;
 }
 wss.on('connection', ws => {
@@ -106,7 +104,14 @@ async function gradeCode(id, problem, code) {
     const tests = problem.tests; const results = []; let passed = 0;
     for (let i = 0; i < tests.length; i++) {
         try {
-            const response = await axios.post(workerUrl + '/internal/execute', { code, function: problem.function, class_name: problem.class_name, tests: [tests[i]], time_limit_ms: 12000, memory_limit_mb: 2048 }, { timeout: 30000 });
+            const response = await axios.post(workerUrl + '/internal/execute', {
+                code,
+                function: problem.function,
+                ...(problem.class_name ? { class_name: problem.class_name } : {}),
+                tests: [tests[i]],
+                time_limit_ms: 12000,
+                memory_limit_mb: 2048,
+            }, { timeout: 30000 });
             const t = response.data.tests?.[0] || {};
             const status = t.status || 'runtime_error'; if (status === 'accepted') passed++;
             // Never reveal hidden expected or actual output. First case is public sample.
@@ -119,20 +124,97 @@ async function gradeCode(id, problem, code) {
     }
     await update(id, { status: passed === tests.length ? 'accepted' : 'failed', passed, total: tests.length, score: tests.length ? passed * 100 / tests.length : 0, metric: 'AC rate', results: JSON.stringify(results) }, 'completed');
 }
-async function gradeCsv(id, slug, buffer) {
+async function gradeCsv(id, problem, buffer) {
     try {
-        const { data } = await axios.post(csvUrl + '/grade/' + encodeURIComponent(slug), buffer, { headers: { 'Content-Type': 'text/csv', 'X-Internal-Key': process.env.CSV_INTERNAL_KEY }, timeout: 120000, maxBodyLength: 12 * 1024 * 1024 });
-        await update(id, { status: data.status === 'accepted' ? 'accepted' : 'failed', score: data.score ?? null, metric: data.metric ?? null, error: data.message ?? null, results: JSON.stringify([data]), passed: data.status === 'accepted' ? 1 : 0, total: 1 }, 'completed');
+        const { data } = await axios.post(csvUrl + '/grade/' + encodeURIComponent(problem.slug), buffer, { headers: { 'Content-Type': 'text/csv', 'X-Internal-Key': process.env.CSV_INTERNAL_KEY }, timeout: 120000, maxBodyLength: 12 * 1024 * 1024 });
+        const normalizedScore = data.status === 'accepted' ? normalizeMetricScore(data.score, problem) : null;
+        await update(id, { status: data.status === 'accepted' ? 'accepted' : 'failed', score: data.score ?? null, normalized_score: normalizedScore, metric: data.metric ?? null, error: data.message ?? null, results: JSON.stringify([{ ...data, normalized_score: normalizedScore }]), passed: data.status === 'accepted' ? 1 : 0, total: 1 }, 'completed');
     } catch (e) { await update(id, { status: 'failed', error: String(e.response?.data?.detail || e.message).slice(0, 500) }, 'completed') }
 }
 const seededProblems = JSON.parse(await readFile(new URL('./problems.json', import.meta.url), 'utf8'));
 async function listProblems() {
     const q = await pool.query(`SELECT p.data,COUNT(s.id)::int AS submissions,COUNT(DISTINCT s.user_id)::int AS participants
         FROM problems p LEFT JOIN submissions s ON s.problem_slug=p.slug
-        WHERE p.active=true GROUP BY p.slug,p.data,p.created_at ORDER BY p.created_at DESC,p.slug DESC`);
+        WHERE p.active=true AND NOT EXISTS (
+            SELECT 1 FROM contest_problems cp JOIN contests c ON c.id=cp.contest_id
+            WHERE cp.problem_slug=p.slug AND (c.status='closed' OR (c.status='open' AND c.end_at>now()))
+        ) GROUP BY p.slug,p.data,p.created_at ORDER BY p.created_at DESC,p.slug DESC`);
     return q.rows;
 }
-async function findProblem(slug) { const q = await pool.query('SELECT data FROM problems WHERE slug=$1 AND active=true', [slug]); return q.rows[0]?.data || null }
+async function findProblem(slug) {
+    const q = await pool.query(`SELECT p.data FROM problems p WHERE p.slug=$1 AND p.active=true AND NOT EXISTS (
+        SELECT 1 FROM contest_problems cp JOIN contests c ON c.id=cp.contest_id
+        WHERE cp.problem_slug=p.slug AND (c.status='closed' OR (c.status='open' AND c.end_at>now()))
+    )`, [slug]);
+    return q.rows[0]?.data || null;
+}
+
+async function syncExpiredContests() {
+    await pool.query("UPDATE contests SET status='ended',updated_at=now() WHERE status='open' AND end_at<=now()");
+}
+
+const contestView = row => ({
+    id: row.id,
+    slug: row.slug,
+    title: row.title,
+    description: row.description,
+    type: row.type,
+    duration_minutes: row.duration_minutes,
+    status: effectiveContestStatus(row),
+    start_at: row.start_at,
+    end_at: row.end_at,
+    created_at: row.created_at,
+    problem_count: Number(row.problem_count || 0),
+    participant_count: Number(row.participant_count || 0),
+    joined: Boolean(row.joined),
+});
+
+async function contestForSlug(slug, userId = null) {
+    await syncExpiredContests();
+    const q = await pool.query(`SELECT c.*,
+        COUNT(DISTINCT cp.problem_slug)::int AS problem_count,
+        COUNT(DISTINCT all_participants.user_id)::int AS participant_count,
+        BOOL_OR(joined.user_id IS NOT NULL) AS joined
+        FROM contests c
+        LEFT JOIN contest_problems cp ON cp.contest_id=c.id
+        LEFT JOIN contest_participants all_participants ON all_participants.contest_id=c.id
+        LEFT JOIN contest_participants joined ON joined.contest_id=c.id AND joined.user_id=$2
+        WHERE c.slug=$1 GROUP BY c.id`, [slug, userId]);
+    return q.rows[0] || null;
+}
+
+async function contestProblem(contestId, problemSlug) {
+    const q = await pool.query(`SELECT p.data,cp.position,cp.label FROM contest_problems cp
+        JOIN problems p ON p.slug=cp.problem_slug WHERE cp.contest_id=$1 AND cp.problem_slug=$2`, [contestId, problemSlug]);
+    return q.rows[0] || null;
+}
+
+async function currentUserRole(userId) {
+    const q = await pool.query('SELECT role FROM users WHERE id=$1', [userId]);
+    return q.rows[0]?.role || null;
+}
+
+function canReadContestProblems(contest, user) {
+    const status = effectiveContestStatus(contest);
+    return status === 'ended' || user?.role === 'admin' || (status === 'open' && contest.joined);
+}
+
+async function submissionProblem(user, slug, kind, contestSlug) {
+    if (!contestSlug) {
+        const problem = await findProblem(slug);
+        if (!problem || problem.kind !== kind) throw Object.assign(Error('Invalid or unavailable problem'), { statusCode: 400 });
+        return { problem, contestId: null };
+    }
+    const role = await currentUserRole(user.id);
+    const contest = await contestForSlug(contestSlug, user.id);
+    if (!contest) throw Object.assign(Error('Contest not found'), { statusCode: 404 });
+    if (!roleCanEnterContest(contest.type, role)) throw Object.assign(Error('This account type cannot enter this contest'), { statusCode: 403 });
+    if (!contest.joined) throw Object.assign(Error('Enter the contest password before submitting'), { statusCode: 403 });
+    if (!contestAcceptsSubmissions(contest)) throw Object.assign(Error('Contest has ended. New submissions are no longer accepted.'), { statusCode: 409 });
+    const attached = await contestProblem(contest.id, slug);
+    if (!attached || attached.data.kind !== kind || contest.type !== kind) throw Object.assign(Error('Problem is not part of this contest'), { statusCode: 400 });
+    return { problem: attached.data, contestId: contest.id };
+}
 const csvRoot = process.env.CSV_PROBLEMS_DIR || '/data/csv-problems';
 const uploadTmp = process.env.DATASET_UPLOAD_TMP || '/tmp/itclub-dataset-uploads';
 const datasetMaxMb = Math.min(1024, Math.max(10, Number(process.env.DATASET_MAX_MB) || 100));
@@ -152,7 +234,12 @@ const ALL_CHALLENGE_FILENAMES = new Set([
     ...Object.values(PUBLIC_DATA_FILES).map(file => file.filename),
     ...Object.values(PRIVATE_DATA_FILES).map(file => file.filename),
 ]);
-const csvMetrics = { binary_probability: ['log_loss', 'accuracy', 'f1', 'precision', 'recall', 'balanced_accuracy'], multiclass_probability: ['log_loss', 'accuracy', 'macro_f1', 'macro_precision', 'macro_recall'], multilabel_probability: ['micro_f1', 'macro_f1', 'hamming_loss'], regression: ['rmse', 'mae', 'mse', 'r2', 'mape', 'smape'], ranking: ['ndcg_at_k', 'mrr', 'map', 'recall_at_k'], text_generation: ['sacrebleu', 'chrf'] };
+const csvMetrics = { binary_probability: ['log_loss', 'accuracy', 'f1', 'precision', 'recall', 'balanced_accuracy'], multiclass_label: ['accuracy', 'macro_f1'], multiclass_probability: ['log_loss', 'accuracy', 'macro_f1', 'macro_precision', 'macro_recall'], multilabel_probability: ['micro_f1', 'macro_f1', 'hamming_loss'], regression: ['rmse', 'mae', 'mse', 'r2', 'mape', 'smape'], ranking: ['ndcg_at_k', 'mrr', 'map', 'recall_at_k'], text_generation: ['sacrebleu', 'chrf'] };
+const legacyCompetitionBaselines = Object.freeze({
+    'bank-deposit-propensity': 0.43388528917686586,
+    'dry-bean-vision-features': 0.8128379591619702,
+    'wine-quality-regression': 0.743091088339953,
+});
 const validateSlug = s => typeof s === 'string' && /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(s) && s.length <= 80;
 // Older bundled challenges use underscores. Keep their paths manageable while
 // requiring the stricter hyphenated format for newly authored problems.
@@ -225,7 +312,7 @@ function testFromText(input, output) {
     return {args: input.replace(/\r\n/g, '\n').split('\n').filter(line => line.trim()).map(parsePlainValue), expected: parsePlainValue(output)};
 }
 function problemFields(body) {
-    const slug = String(body.slug || ''), title = String(body.title || ''), description = String(body.description || ''), kind = body.kind;
+    const slug = String(body.slug || ''), title = String(body.title || ''), description = normalizeProblemText(body.description), kind = body.kind;
     if (!validateSlug(slug) || !validText(title, 160) || !validText(description, 12000) || !['code', 'csv'].includes(kind)) throw Error('Invalid slug, title, description or type');
     const difficulty = ['Easy', 'Medium', 'Hard'].includes(body.difficulty) ? body.difficulty : 'Medium';
     const base = { slug, title, description, kind, difficulty, category: String(body.category || 'General').slice(0, 80) };
@@ -234,14 +321,27 @@ function problemFields(body) {
         if (JSON.stringify(tests).length > 100000) throw Error('Test cases exceed 100 KB');
         if (!validText(body.function, 100) || !/^[a-zA-Z_][a-zA-Z_0-9]*$/.test(body.function)) throw Error('Invalid function name');
         if (body.class_name && !/^[a-zA-Z_][a-zA-Z_0-9]*$/.test(body.class_name)) throw Error('Invalid class name');
-        return { ...base, starter: String(body.starter || '').slice(0, 20000), function: body.function, class_name: body.class_name || null, tests };
+        return { ...base, starter: normalizeProblemText(body.starter).slice(0, 20000), function: body.function, class_name: body.class_name || null, tests };
     }
     const config = parseJson(body.config); if (!config || typeof config !== 'object' || Array.isArray(config)) throw Error('CSV configuration must be JSON');
     if (!csvMetrics[config.task_type]?.includes(config.metric)) throw Error('Unsupported task_type or metric');
     if (!validText(config.id_column, 100) || !Array.isArray(config.prediction_columns) || !config.prediction_columns.length || !config.prediction_columns.every(x => validText(x, 100))) throw Error('Invalid CSV column configuration');
     if (config.task_type === 'ranking' && !validText(config.item_column, 100)) throw Error('Ranking needs item_column');
     if (!validText(config.target_column, 100)) throw Error('target_column is required');
-    return { ...base, starter: '', tests: [], metric: config.metric, config: { ...config, version: 1, max_file_size_mb: 10, max_rows: Math.min(100000, Math.max(1, Number(config.max_rows) || 100000)) } };
+    const baselineScore = Number(config.baseline_score);
+    const perfectScore = perfectScoreForMetric(config.metric);
+    if (!Number.isFinite(baselineScore)) throw Error('baseline_score must be a finite number measured from the provided baseline');
+    if (!Number.isFinite(perfectScore)) throw Error('No perfect score is registered for this metric');
+    if ((config.greater_is_better && baselineScore >= perfectScore) || (!config.greater_is_better && baselineScore <= perfectScore)) throw Error('baseline_score must be worse than the perfect score for this metric');
+    return { ...base, starter: '', tests: [], metric: config.metric, config: { ...config, baseline_score: baselineScore, perfect_score: perfectScore, version: 1, max_file_size_mb: 10, max_rows: Math.min(100000, Math.max(1, Number(config.max_rows) || 100000)) } };
+}
+
+async function refreshNormalizedScores(problem) {
+    const scale = scoreScale(problem);
+    if (!scale) return;
+    await pool.query(`UPDATE submissions
+        SET normalized_score=LEAST(100.0,GREATEST(0.0,(score-$2)/($3-$2)*100.0))
+        WHERE problem_slug=$1 AND kind='csv' AND score IS NOT NULL`, [problem.slug, scale.baseline, scale.perfect]);
 }
 
 async function initialize() {
@@ -263,6 +363,15 @@ async function initialize() {
     await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar TEXT");
     await pool.query(`CREATE TABLE IF NOT EXISTS problems(slug VARCHAR(80) PRIMARY KEY,data JSONB NOT NULL,active BOOLEAN NOT NULL DEFAULT TRUE,created_at TIMESTAMPTZ NOT NULL DEFAULT now(),updated_at TIMESTAMPTZ NOT NULL DEFAULT now())`);
     for (const p of seededProblems) { await pool.query('INSERT INTO problems(slug,data) VALUES($1,$2::jsonb) ON CONFLICT(slug) DO NOTHING', [p.slug, JSON.stringify(p)]) }
+    for (const [slug, baseline] of Object.entries(legacyCompetitionBaselines)) {
+        const problem = await pool.query('SELECT data FROM problems WHERE slug=$1', [slug]);
+        if (!problem.rowCount || problem.rows[0].data.kind !== 'csv') continue;
+        const metric = problem.rows[0].data.config?.metric || problem.rows[0].data.metric;
+        const perfect = perfectScoreForMetric(metric);
+        if (!Number.isFinite(perfect)) continue;
+        await pool.query(`UPDATE problems SET data=jsonb_set(jsonb_set(data,'{config,baseline_score}',to_jsonb($2::double precision),true),'{config,perfect_score}',to_jsonb($3::double precision),true)
+            WHERE slug=$1 AND data#>>'{config,baseline_score}' IS NULL`, [slug, baseline, perfect]);
+    }
     const adminUsername = process.env.ADMIN_BOOTSTRAP_USERNAME; const adminPassword = process.env.ADMIN_BOOTSTRAP_PASSWORD;
     if (adminUsername && adminPassword) {
         if (!/^[a-zA-Z0-9_]{3,40}$/.test(adminUsername) || adminPassword.length < 16) throw Error('Invalid admin bootstrap settings');
@@ -271,9 +380,29 @@ async function initialize() {
         else if (r.rows[0].role !== 'admin') throw Error('ADMIN_BOOTSTRAP_USERNAME conflicts with a non-admin account');
     }
 
+    await pool.query(`CREATE TABLE IF NOT EXISTS contests(
+        id UUID PRIMARY KEY,slug VARCHAR(80) NOT NULL UNIQUE,title VARCHAR(160) NOT NULL,description TEXT NOT NULL DEFAULT '',
+        type VARCHAR(10) NOT NULL CHECK(type IN ('code','csv')),password_hash TEXT NOT NULL,duration_minutes INT NOT NULL CHECK(duration_minutes BETWEEN 5 AND 10080),
+        status VARCHAR(12) NOT NULL DEFAULT 'closed' CHECK(status IN ('closed','open','ended')),
+        start_at TIMESTAMPTZ,end_at TIMESTAMPTZ,created_at TIMESTAMPTZ NOT NULL DEFAULT now(),updated_at TIMESTAMPTZ NOT NULL DEFAULT now())`);
+    await pool.query('ALTER TABLE contests DROP CONSTRAINT IF EXISTS contests_status_check');
+    await pool.query("UPDATE contests SET status='closed' WHERE status='draft'");
+    await pool.query("ALTER TABLE contests ALTER COLUMN status SET DEFAULT 'closed'");
+    await pool.query("ALTER TABLE contests ADD CONSTRAINT contests_status_check CHECK(status IN ('closed','open','ended'))");
+    await pool.query(`CREATE TABLE IF NOT EXISTS contest_problems(
+        contest_id UUID NOT NULL REFERENCES contests(id) ON DELETE CASCADE,problem_slug VARCHAR(80) NOT NULL REFERENCES problems(slug) ON DELETE RESTRICT,
+        position INT NOT NULL,label VARCHAR(8) NOT NULL,PRIMARY KEY(contest_id,problem_slug),UNIQUE(contest_id,position),UNIQUE(contest_id,label))`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS contest_participants(
+        contest_id UUID NOT NULL REFERENCES contests(id) ON DELETE CASCADE,user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        joined_at TIMESTAMPTZ NOT NULL DEFAULT now(),PRIMARY KEY(contest_id,user_id))`);
     await pool.query(`CREATE TABLE IF NOT EXISTS submissions(id UUID PRIMARY KEY,user_id UUID NOT NULL REFERENCES users(id),problem_slug VARCHAR(100) NOT NULL,kind VARCHAR(10) NOT NULL,status VARCHAR(30) NOT NULL DEFAULT 'queued',code TEXT,passed INT NOT NULL DEFAULT 0,total INT NOT NULL DEFAULT 0,score DOUBLE PRECISION,metric VARCHAR(100),results JSONB NOT NULL DEFAULT '[]'::jsonb,error TEXT,created_at TIMESTAMPTZ NOT NULL DEFAULT now())`);
+    await pool.query('ALTER TABLE submissions ADD COLUMN IF NOT EXISTS normalized_score DOUBLE PRECISION');
+    await pool.query('ALTER TABLE submissions ADD COLUMN IF NOT EXISTS contest_id UUID REFERENCES contests(id) ON DELETE SET NULL');
     await pool.query('CREATE INDEX IF NOT EXISTS submissions_user_id_idx ON submissions(user_id,created_at DESC)');
     await pool.query('CREATE INDEX IF NOT EXISTS submissions_problem_score_idx ON submissions(problem_slug,user_id,status,score,created_at)');
+    await pool.query('CREATE INDEX IF NOT EXISTS submissions_contest_idx ON submissions(contest_id,user_id,problem_slug,created_at DESC)');
+    const csvProblems = await pool.query("SELECT data FROM problems WHERE data->>'kind'='csv'");
+    for (const row of csvProblems.rows) await refreshNormalizedScores(row.data);
 }
 app.get('/api/health', (_req, res) => res.json({ status: 'ok', services: ['auth-api', 'rust-worker', 'csv-judge'] }));
 app.post('/api/auth/register', asyncRoute(async (req, res) => {
@@ -348,21 +477,160 @@ app.get('/api/problems/:slug/sample-submission.csv', asyncRoute(async(req,res) =
     if (file) return res.type(file.contentType).download(file.path, `${p.slug}-sample-submission.csv`);
     res.status(404).json({error:'Sample not found'});
 }));
-app.get('/api/contests', (_req, res) => res.json({ contests: [] }));
+app.get('/api/contests', optionalAuth, asyncRoute(async (req, res) => {
+    await syncExpiredContests();
+    const q = await pool.query(`SELECT c.*,
+        COUNT(DISTINCT cp.problem_slug)::int AS problem_count,
+        COUNT(DISTINCT participants.user_id)::int AS participant_count,
+        BOOL_OR(joined.user_id IS NOT NULL) AS joined
+        FROM contests c
+        LEFT JOIN contest_problems cp ON cp.contest_id=c.id
+        LEFT JOIN contest_participants participants ON participants.contest_id=c.id
+        LEFT JOIN contest_participants joined ON joined.contest_id=c.id AND joined.user_id=$1
+        GROUP BY c.id
+        ORDER BY c.created_at DESC`, [req.user?.id || null]);
+    res.json({ contests: q.rows.map(contestView) });
+}));
+
+app.get('/api/contests/:slug', optionalAuth, asyncRoute(async (req, res) => {
+    const contest = await contestForSlug(req.params.slug, req.user?.id || null);
+    if (!contest) return res.status(404).json({ error: 'Contest not found' });
+    let problems = [];
+    if (canReadContestProblems(contest, req.user)) {
+        const q = await pool.query(`SELECT cp.label,cp.position,p.data FROM contest_problems cp JOIN problems p ON p.slug=cp.problem_slug
+            WHERE cp.contest_id=$1 ORDER BY cp.position`, [contest.id]);
+        problems = q.rows.map(row => ({ ...publicProblem(row.data), label: row.label, position: row.position }));
+    }
+    res.json({ contest: { ...contestView(contest), can_access: canReadContestProblems(contest, req.user), problems } });
+}));
+
+app.post('/api/contests/:slug/join', auth, rateLimit({ windowMs: 60000, limit: 10 }), asyncRoute(async (req, res) => {
+    const contest = await contestForSlug(req.params.slug, req.user.id);
+    if (!contest) return res.status(404).json({ error: 'Contest not found' });
+    if (effectiveContestStatus(contest) !== 'open') return res.status(409).json({ error: 'This contest is not currently open' });
+    const role = await currentUserRole(req.user.id);
+    if (!roleCanEnterContest(contest.type, role) || role === 'admin') return res.status(403).json({ error: contest.type === 'csv' ? 'A team account is required for this contest' : 'A personal student account is required for this contest' });
+    if (typeof req.body?.password !== 'string' || !(await bcrypt.compare(req.body.password, contest.password_hash))) return res.status(403).json({ error: 'Incorrect contest password' });
+    await pool.query('INSERT INTO contest_participants(contest_id,user_id) VALUES($1,$2) ON CONFLICT DO NOTHING', [contest.id, req.user.id]);
+    res.json({ ok: true });
+}));
+
+async function readableContestProblem(req, res) {
+    const contest = await contestForSlug(req.params.slug, req.user?.id || null);
+    if (!contest || !canReadContestProblems(contest, req.user)) {
+        res.status(403).json({ error: effectiveContestStatus(contest) === 'open' ? 'Join this contest to view its problems' : 'Contest problem is unavailable' });
+        return null;
+    }
+    const attached = await contestProblem(contest.id, req.params.problemSlug);
+    if (!attached) { res.status(404).json({ error: 'Contest problem not found' }); return null; }
+    return { contest, attached };
+}
+
+app.get('/api/contests/:slug/problems/:problemSlug', optionalAuth, asyncRoute(async (req, res) => {
+    const context = await readableContestProblem(req, res); if (!context) return;
+    res.json({ problem: { ...publicProblem(context.attached.data), label: context.attached.label }, contest: contestView(context.contest) });
+}));
+app.get('/api/contests/:slug/problems/:problemSlug/data-files', optionalAuth, asyncRoute(async (req, res) => {
+    const context = await readableContestProblem(req, res); if (!context) return;
+    if (context.attached.data.kind !== 'csv') return res.status(404).json({ error: 'CSV problem not found' });
+    res.json({ files: await publicDataFiles(context.attached.data.slug), max_challenge_size_mb: datasetMaxMb });
+}));
+app.get('/api/contests/:slug/problems/:problemSlug/data/:fileKey', optionalAuth, asyncRoute(async (req, res) => {
+    const context = await readableContestProblem(req, res); if (!context) return;
+    const file = await locatePublicDataFile(context.attached.data.slug, req.params.fileKey);
+    if (!file) return res.status(404).json({ error: 'Competition file not found' });
+    res.type(file.contentType).download(file.path, `${context.attached.data.slug}-${file.filename}`);
+}));
+app.get('/api/contests/:slug/problems/:problemSlug/sample-input.txt', optionalAuth, asyncRoute(async (req, res) => {
+    const context = await readableContestProblem(req, res); if (!context) return;
+    const problem = context.attached.data;
+    if (problem.kind !== 'code' || !problem.tests?.length) return res.status(404).json({ error: 'Sample not found' });
+    const sample = problem.tests[0];
+    res.type('text/plain').attachment(`${problem.slug}-sample-input.txt`).send(sample.args.map(value => typeof value === 'string' ? value : JSON.stringify(value)).join('\n') + '\n');
+}));
+
+app.get('/api/contests/:slug/leaderboard', optionalAuth, asyncRoute(async (req, res) => {
+    const contest = await contestForSlug(req.params.slug, req.user?.id || null);
+    if (!contest || (effectiveContestStatus(contest) !== 'ended' && !canReadContestProblems(contest, req.user))) return res.status(403).json({ error: 'Contest leaderboard is unavailable' });
+    const problemsResult = await pool.query('SELECT problem_slug,label,position FROM contest_problems WHERE contest_id=$1 ORDER BY position', [contest.id]);
+    const participantsResult = await pool.query(`SELECT u.id,u.username,u.avatar,cp.joined_at FROM contest_participants cp JOIN users u ON u.id=cp.user_id
+        WHERE cp.contest_id=$1 ORDER BY cp.joined_at,u.username`, [contest.id]);
+    const submissionsResult = await pool.query(`SELECT s.user_id,s.problem_slug,s.score,s.normalized_score,s.status,s.created_at,s.id,
+        CASE WHEN s.kind='csv' THEN s.normalized_score ELSE s.score END AS contest_score
+        FROM submissions s WHERE s.contest_id=$1 AND s.status IN ('accepted','failed')
+        ORDER BY s.user_id,s.problem_slug,contest_score DESC NULLS LAST,s.created_at ASC,s.id ASC`, [contest.id]);
+    const attemptsResult = await pool.query('SELECT user_id,COUNT(*)::int AS attempts FROM submissions WHERE contest_id=$1 GROUP BY user_id', [contest.id]);
+    const attempts = new Map(attemptsResult.rows.map(row => [row.user_id, row.attempts]));
+    const best = new Map();
+    const attemptsByProblem = new Map();
+    const firstSolve = new Map();
+    for (const row of submissionsResult.rows) {
+        const key = `${row.user_id}:${row.problem_slug}`;
+        attemptsByProblem.set(key, (attemptsByProblem.get(key) || 0) + 1);
+        if (row.contest_score != null && !best.has(key)) best.set(key, row);
+        if (row.status === 'accepted' && Number(row.contest_score) >= 99.999) {
+            const first = firstSolve.get(row.problem_slug);
+            if (!first || new Date(row.created_at) < new Date(first.created_at)) firstSolve.set(row.problem_slug, row);
+        }
+    }
+    const entries = participantsResult.rows.map(participant => {
+        const scores = {}; let total = 0; let achievedAt = null;
+        for (const problem of problemsResult.rows) {
+            const row = best.get(`${participant.id}:${problem.problem_slug}`);
+            const score = row ? Number(row.contest_score) : 0;
+            const solved = Boolean(row && row.status === 'accepted' && score >= 99.999);
+            const elapsedSeconds = solved && contest.start_at ? Math.max(0, Math.floor((new Date(row.created_at) - new Date(contest.start_at)) / 1000)) : null;
+            scores[problem.label] = {
+                score,
+                attempts: attemptsByProblem.get(`${participant.id}:${problem.problem_slug}`) || 0,
+                solved,
+                solved_at: solved ? row.created_at : null,
+                elapsed_seconds: elapsedSeconds,
+                first_solve: solved && firstSolve.get(problem.problem_slug)?.user_id === participant.id,
+            };
+            total += score;
+            if (row && (!achievedAt || new Date(row.created_at) > new Date(achievedAt))) achievedAt = row.created_at;
+        }
+        return { username: participant.username, avatar: participant.avatar, scores, total, attempts: attempts.get(participant.id) || 0, achieved_at: achievedAt };
+    }).sort((a, b) => b.total - a.total || (a.achieved_at ? new Date(a.achieved_at) : Infinity) - (b.achieved_at ? new Date(b.achieved_at) : Infinity) || a.attempts - b.attempts || a.username.localeCompare(b.username));
+    entries.forEach((entry, index) => { entry.rank = index + 1; });
+    res.json({ contest: contestView(contest), problems: problemsResult.rows, entries });
+}));
 app.get('/api/leaderboard', asyncRoute(async (_req, res) => {
-    const q = await pool.query(`SELECT u.username,u.avatar,COUNT(DISTINCT s.problem_slug) FILTER(WHERE s.status='accepted')::int AS solved,COUNT(s.id)::int AS attempts
-        FROM users u LEFT JOIN submissions s ON u.id=s.user_id AND s.kind='code' WHERE u.role<>'admin' GROUP BY u.id ORDER BY solved DESC,attempts ASC,u.username LIMIT 50`);
+    const q = await pool.query(`WITH first_accept AS (
+            SELECT user_id,problem_slug,MIN(created_at) AS accepted_at
+            FROM submissions
+            WHERE kind='code' AND status='accepted'
+            GROUP BY user_id,problem_slug
+        ), rank_stats AS (
+            SELECT s.user_id,
+                COUNT(DISTINCT s.problem_slug) FILTER(WHERE s.status='accepted')::int AS solved,
+                COUNT(s.id) FILTER(WHERE fa.accepted_at IS NULL OR s.created_at<=fa.accepted_at)::int AS attempts
+            FROM submissions s
+            LEFT JOIN first_accept fa ON fa.user_id=s.user_id AND fa.problem_slug=s.problem_slug
+            WHERE s.kind='code'
+            GROUP BY s.user_id
+        )
+        SELECT u.username,u.avatar,COALESCE(rs.solved,0)::int AS solved,COALESCE(rs.attempts,0)::int AS attempts
+        FROM users u
+        LEFT JOIN rank_stats rs ON rs.user_id=u.id
+        WHERE u.role='student'
+        ORDER BY solved DESC,attempts ASC,u.username
+        LIMIT 50`);
     res.json({ users: q.rows });
 }));
 app.get('/api/submissions', auth, asyncRoute(async (req, res) => {
     const slug = typeof req.query.slug === 'string' ? req.query.slug : null;
-    const fields = `s.id,s.problem_slug,s.kind,s.status,s.passed,s.total,
+    const contestSlug = typeof req.query.contest_slug === 'string' ? req.query.contest_slug : null;
+    const fields = `s.id,s.problem_slug,s.kind,s.status,s.passed,s.total,s.normalized_score,
         CASE WHEN s.kind='code' AND s.total>0 THEN s.passed::double precision*100/s.total ELSE s.score END AS score,
         CASE WHEN s.kind='code' THEN 'AC rate' ELSE s.metric END AS metric,s.created_at,
         COALESCE(p.data->>'title',s.problem_slug) AS problem_title,
         COALESCE(p.data->>'category',CASE WHEN s.kind='csv' THEN 'AI Track' ELSE 'Function Only' END) AS problem_category`;
     const q = slug
-        ? await pool.query(`SELECT ${fields} FROM submissions s LEFT JOIN problems p ON p.slug=s.problem_slug WHERE s.user_id=$1 AND s.problem_slug=$2 ORDER BY s.created_at DESC LIMIT 100`, [req.user.id, slug])
+        ? contestSlug
+            ? await pool.query(`SELECT ${fields} FROM submissions s LEFT JOIN problems p ON p.slug=s.problem_slug JOIN contests c ON c.id=s.contest_id WHERE s.user_id=$1 AND s.problem_slug=$2 AND c.slug=$3 ORDER BY s.created_at DESC LIMIT 100`, [req.user.id, slug, contestSlug])
+            : await pool.query(`SELECT ${fields} FROM submissions s LEFT JOIN problems p ON p.slug=s.problem_slug WHERE s.user_id=$1 AND s.problem_slug=$2 AND s.contest_id IS NULL ORDER BY s.created_at DESC LIMIT 100`, [req.user.id, slug])
         : await pool.query(`SELECT ${fields} FROM submissions s LEFT JOIN problems p ON p.slug=s.problem_slug WHERE s.user_id=$1 ORDER BY s.created_at DESC LIMIT 100`, [req.user.id]);
     res.json({ submissions: q.rows });
 }));
@@ -370,7 +638,7 @@ app.get('/api/submissions/:id', auth, asyncRoute(async (req, res) => { const s =
 app.get('/api/problems/:slug/solutions', asyncRoute(async (req, res) => {
     const problem = await findProblem(req.params.slug);
     if (!problem) return res.status(404).json({ error: 'Problem not found' });
-    const q = await pool.query(`SELECT s.id,s.kind,s.status,s.passed,s.total,
+    const q = await pool.query(`SELECT s.id,s.kind,s.status,s.passed,s.total,s.normalized_score,
         CASE WHEN s.kind='code' AND s.total>0 THEN s.passed::double precision*100/s.total ELSE s.score END AS score,
         CASE WHEN s.kind='code' THEN 'AC rate' ELSE s.metric END AS metric,s.created_at,u.username,u.avatar
         FROM submissions s JOIN users u ON u.id=s.user_id
@@ -389,15 +657,15 @@ app.get('/api/problems/:slug/leaderboard', asyncRoute(async (req, res) => {
             SELECT user_id,COUNT(*)::int AS attempts
             FROM submissions WHERE problem_slug=$1 GROUP BY user_id
         ), best AS (
-            SELECT s.id,s.user_id,s.score,s.created_at,u.username,u.avatar,a.attempts,
-                ROW_NUMBER() OVER (PARTITION BY s.user_id ORDER BY s.score ${direction},s.created_at ASC,s.id ASC) AS user_rank
+            SELECT s.id,s.user_id,s.score,s.normalized_score,s.created_at,u.username,u.avatar,a.attempts,
+                ROW_NUMBER() OVER (PARTITION BY s.user_id ORDER BY s.normalized_score DESC NULLS LAST,s.score ${direction},s.created_at ASC,s.id ASC) AS user_rank
             FROM submissions s
             JOIN users u ON u.id=s.user_id
             JOIN attempts a ON a.user_id=s.user_id
             WHERE s.problem_slug=$1 AND s.kind='csv' AND s.status='accepted' AND s.score IS NOT NULL AND u.role<>'admin'
         ), placed AS (
-            SELECT id AS best_submission_id,username,avatar,score,attempts,created_at AS achieved_at,
-                (ROW_NUMBER() OVER (ORDER BY score ${direction},created_at ASC,username ASC))::int AS rank,
+            SELECT id AS best_submission_id,username,avatar,score,normalized_score,attempts,created_at AS achieved_at,
+                (ROW_NUMBER() OVER (ORDER BY normalized_score DESC NULLS LAST,score ${direction},created_at ASC,username ASC))::int AS rank,
                 COUNT(*) OVER ()::int AS total_participants
             FROM best WHERE user_rank=1
         )
@@ -406,6 +674,8 @@ app.get('/api/problems/:slug/leaderboard', asyncRoute(async (req, res) => {
     res.json({
         metric: problem.metric,
         greater_is_better: Boolean(problem.config?.greater_is_better),
+        baseline_score: scoreScale(problem)?.baseline ?? null,
+        perfect_score: scoreScale(problem)?.perfect ?? null,
         page,
         limit,
         total_participants: totalParticipants,
@@ -413,19 +683,20 @@ app.get('/api/problems/:slug/leaderboard', asyncRoute(async (req, res) => {
     });
 }));
 app.post('/api/submissions/code', auth, rateLimit({ windowMs: 60000, limit: 12 }), asyncRoute(async (req, res) => {
-    const { slug, code } = req.body || {}; const p = await findProblem(slug);
-    if (!p || p.kind !== 'code' || typeof code !== 'string' || !code.trim() || code.length > 50000) return res.status(400).json({ error: 'Invalid code submission' });
+    const { slug, code, contest_slug: contestSlug } = req.body || {};
+    if (typeof code !== 'string' || !code.trim() || code.length > 50000) return res.status(400).json({ error: 'Invalid code submission' });
+    const { problem: p, contestId } = await submissionProblem(req.user, slug, 'code', contestSlug);
     if (queue.length >= MAX_QUEUE) return res.status(503).json({ error: 'Judge queue full' });
-    const id = randomUUID(); await pool.query('INSERT INTO submissions(id,user_id,problem_slug,kind,code,total) VALUES($1,$2,$3,$4,$5,$6)', [id, req.user.id, slug, 'code', code, p.tests.length]);
+    const id = randomUUID(); await pool.query('INSERT INTO submissions(id,user_id,problem_slug,kind,code,total,contest_id) VALUES($1,$2,$3,$4,$5,$6,$7)', [id, req.user.id, slug, 'code', code, p.tests.length, contestId]);
     enqueue(() => gradeCode(id, p, code)); res.status(202).json({ id, status: 'queued' });
 }));
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024, files: 1 } });
 app.post('/api/submissions/csv', auth, rateLimit({ windowMs: 60000, limit: 12 }), upload.single('file'), asyncRoute(async (req, res) => {
-    const p = await findProblem(req.body.slug);
-    if (!p || p.kind !== 'csv' || !req.file || !req.file.originalname.toLowerCase().endsWith('.csv')) return res.status(400).json({ error: 'Select a valid CSV problem and .csv file' });
+    if (!req.file || !req.file.originalname.toLowerCase().endsWith('.csv')) return res.status(400).json({ error: 'Select a valid CSV problem and .csv file' });
+    const { problem: p, contestId } = await submissionProblem(req.user, req.body.slug, 'csv', req.body.contest_slug);
     if (queue.length >= MAX_QUEUE) return res.status(503).json({ error: 'Judge queue full' });
-    const id = randomUUID(); await pool.query('INSERT INTO submissions(id,user_id,problem_slug,kind,total) VALUES($1,$2,$3,$4,1)', [id, req.user.id, p.slug, 'csv']);
-    enqueue(() => gradeCsv(id, p.slug, req.file.buffer)); res.status(202).json({ id, status: 'queued' });
+    const id = randomUUID(); await pool.query('INSERT INTO submissions(id,user_id,problem_slug,kind,total,contest_id) VALUES($1,$2,$3,$4,1,$5)', [id, req.user.id, p.slug, 'csv', contestId]);
+    enqueue(() => gradeCsv(id, p, req.file.buffer)); res.status(202).json({ id, status: 'queued' });
 }));
 // Administrator management. The role is always checked against the DB, not only the JWT.
 const adminUpload = multer({
@@ -458,6 +729,167 @@ async function validateUploadedChallengeFile(file, expectedExtension) {
         if (!(signature[0] === 0x50 && signature[1] === 0x4b && [0x03, 0x05, 0x07].includes(signature[2]))) throw Error('Invalid ZIP upload');
     }
 }
+
+function contestSlugFromTitle(title) {
+    return String(title || '')
+        .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+        .toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 70) || 'contest';
+}
+
+async function uniqueContestSlug(client, title) {
+    const base = contestSlugFromTitle(title);
+    for (let suffix = 0; suffix < 1000; suffix += 1) {
+        const candidate = suffix ? `${base}-${suffix + 1}` : base;
+        const exists = await client.query('SELECT 1 FROM contests WHERE slug=$1', [candidate]);
+        if (!exists.rowCount) return candidate;
+    }
+    throw Error('Could not generate a unique contest URL');
+}
+
+function contestFields(body, forcedSlug = '') {
+    const slug = String(forcedSlug || body?.slug || '').trim();
+    const title = String(body?.title || '').trim();
+    const type = String(body?.type || 'code');
+    const durationMinutes = Number.parseInt(body?.duration_minutes, 10);
+    const password = String(body?.password || '');
+    const problemSlugs = Array.isArray(body?.problem_slugs) ? [...new Set(body.problem_slugs.map(value => String(value)))] : [];
+    if (slug && (!validatePathSlug(slug) || slug.length > 80)) throw Error('Invalid contest URL');
+    if (!title || title.length > 160) throw Error('Contest title is required (maximum 160 characters)');
+    if (!['code', 'csv'].includes(type)) throw Error('Contest type must be Function Code or AI Tracks');
+    if (!Number.isInteger(durationMinutes) || durationMinutes < 5 || durationMinutes > 10080) throw Error('Duration must be between 5 and 10080 minutes');
+    if (password && (password.length < 4 || password.length > 128)) throw Error('Contest password must be 4–128 characters');
+    return { slug, title, type, durationMinutes, password, problemSlugs };
+}
+
+async function replaceContestProblems(client, contestId, type, problemSlugs) {
+    if (problemSlugs.length) {
+        const available = await client.query('SELECT slug,data FROM problems WHERE slug=ANY($1::varchar[])', [problemSlugs]);
+        if (available.rowCount !== problemSlugs.length) throw Error('One or more selected problems do not exist');
+        if (available.rows.some(row => row.data.kind !== type)) throw Error('Every problem must match the contest type');
+        const conflict = await client.query(`SELECT cp.problem_slug FROM contest_problems cp JOIN contests c ON c.id=cp.contest_id
+            WHERE cp.problem_slug=ANY($1::varchar[]) AND cp.contest_id<>$2 AND (c.status='closed' OR (c.status='open' AND c.end_at>now())) LIMIT 1`, [problemSlugs, contestId]);
+        if (conflict.rowCount) throw Error(`${conflict.rows[0].problem_slug} already belongs to another unfinished contest`);
+    }
+    await client.query('DELETE FROM contest_problems WHERE contest_id=$1', [contestId]);
+    for (const [index, problemSlug] of problemSlugs.entries()) {
+        await client.query('INSERT INTO contest_problems(contest_id,problem_slug,position,label) VALUES($1,$2,$3,$4)', [contestId, problemSlug, index, contestProblemLabel(index)]);
+        await client.query('UPDATE problems SET active=true,updated_at=now() WHERE slug=$1', [problemSlug]);
+    }
+}
+
+app.get('/api/admin/team-accounts', auth, admin, asyncRoute(async (_req, res) => {
+    const q = await pool.query("SELECT id,username,email,created_at FROM users WHERE role='team' ORDER BY created_at DESC");
+    res.json({ accounts: q.rows });
+}));
+app.post('/api/admin/team-accounts', auth, admin, rateLimit({ windowMs: 60000, limit: 20 }), asyncRoute(async (req, res) => {
+    const username = String(req.body?.username || '').trim();
+    const password = String(req.body?.password || '');
+    if (!/^[a-zA-Z0-9_]{3,40}$/.test(username) || password.length < 10 || password.length > 128) return res.status(400).json({ error: 'Username must be 3–40 letters/numbers/_. Password length must be 10–128.' });
+    const id = randomUUID();
+    try { await pool.query('INSERT INTO users(id,username,email,password_hash,role) VALUES($1,$2,$3,$4,$5)', [id, username, `${username.toLowerCase()}@teams.local.invalid`, await bcrypt.hash(password, 12), 'team']); }
+    catch (error) { if (error.code === '23505') return res.status(409).json({ error: 'Team username already exists' }); throw error; }
+    res.status(201).json({ account: { id, username, role: 'team' } });
+}));
+
+app.get('/api/admin/contests', auth, admin, asyncRoute(async (_req, res) => {
+    await syncExpiredContests();
+    const contests = await pool.query(`SELECT c.*,COUNT(DISTINCT cp.problem_slug)::int AS problem_count,COUNT(DISTINCT participants.user_id)::int AS participant_count,
+        COUNT(DISTINCT submissions.id)::int AS submission_count,false AS joined
+        FROM contests c LEFT JOIN contest_problems cp ON cp.contest_id=c.id LEFT JOIN contest_participants participants ON participants.contest_id=c.id
+        LEFT JOIN submissions ON submissions.contest_id=c.id
+        GROUP BY c.id ORDER BY c.created_at DESC`);
+    const assignments = await pool.query('SELECT contest_id,problem_slug,label,position FROM contest_problems ORDER BY contest_id,position');
+    const byContest = new Map();
+    for (const row of assignments.rows) { if (!byContest.has(row.contest_id)) byContest.set(row.contest_id, []); byContest.get(row.contest_id).push(row); }
+    res.json({ contests: contests.rows.map(row => ({ ...contestView(row), problems: byContest.get(row.id) || [] })) });
+}));
+
+app.post('/api/admin/contests', auth, admin, asyncRoute(async (req, res) => {
+    let fields; try { fields = contestFields(req.body); } catch (error) { return res.status(400).json({ error: error.message }); }
+    if (!fields.password) return res.status(400).json({ error: 'Contest password is required' });
+    const id = randomUUID(); const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        fields.slug = await uniqueContestSlug(client, fields.title);
+        await client.query(`INSERT INTO contests(id,slug,title,description,type,password_hash,duration_minutes)
+            VALUES($1,$2,$3,'',$4,$5,$6)`, [id, fields.slug, fields.title, fields.type, await bcrypt.hash(fields.password, 12), fields.durationMinutes]);
+        await replaceContestProblems(client, id, fields.type, fields.problemSlugs);
+        await client.query('COMMIT');
+    } catch (error) { await client.query('ROLLBACK'); if (error.code === '23505') return res.status(409).json({ error: 'Contest slug already exists' }); return res.status(400).json({ error: error.message }); }
+    finally { client.release(); }
+    res.status(201).json({ id, slug: fields.slug });
+}));
+
+app.put('/api/admin/contests/:slug', auth, admin, asyncRoute(async (req, res) => {
+    let fields; try { fields = contestFields(req.body, req.params.slug); } catch (error) { return res.status(400).json({ error: error.message }); }
+    const existing = await pool.query('SELECT * FROM contests WHERE slug=$1', [req.params.slug]);
+    if (!existing.rowCount) return res.status(404).json({ error: 'Contest not found' });
+    if (effectiveContestStatus(existing.rows[0]) !== 'closed') return res.status(409).json({ error: 'Only closed contests can be edited' });
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const passwordHash = fields.password ? await bcrypt.hash(fields.password, 12) : existing.rows[0].password_hash;
+        await client.query(`UPDATE contests SET title=$2,type=$3,password_hash=$4,duration_minutes=$5,updated_at=now() WHERE slug=$1`, [fields.slug, fields.title, fields.type, passwordHash, fields.durationMinutes]);
+        await replaceContestProblems(client, existing.rows[0].id, fields.type, fields.problemSlugs);
+        await client.query('COMMIT');
+    } catch (error) { await client.query('ROLLBACK'); return res.status(400).json({ error: error.message }); }
+    finally { client.release(); }
+    res.json({ ok: true });
+}));
+
+app.delete('/api/admin/contests/:slug', auth, admin, asyncRoute(async (req, res) => {
+    const slug = req.params.slug;
+    if (!validatePathSlug(slug) || req.body?.confirm_slug !== slug) return res.status(400).json({ error: 'Type the exact contest slug to confirm permanent deletion' });
+    await syncExpiredContests();
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const contest = await client.query('SELECT id,title,status FROM contests WHERE slug=$1 FOR UPDATE', [slug]);
+        if (!contest.rowCount) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'Contest not found' });
+        }
+        if (contest.rows[0].status === 'open') {
+            await client.query('ROLLBACK');
+            return res.status(409).json({ error: 'End the contest before deleting it' });
+        }
+        const [problems, participants, submissions] = await Promise.all([
+            client.query('SELECT COUNT(*)::int AS count FROM contest_problems WHERE contest_id=$1', [contest.rows[0].id]),
+            client.query('SELECT COUNT(*)::int AS count FROM contest_participants WHERE contest_id=$1', [contest.rows[0].id]),
+            client.query('SELECT COUNT(*)::int AS count FROM submissions WHERE contest_id=$1', [contest.rows[0].id]),
+        ]);
+        await client.query('DELETE FROM contests WHERE id=$1', [contest.rows[0].id]);
+        await client.query('COMMIT');
+        const result = {
+            ok: true,
+            retained_problems: problems.rows[0].count,
+            removed_participants: participants.rows[0].count,
+            retained_submissions: submissions.rows[0].count,
+        };
+        console.info('admin permanent contest deletion', { admin_id: req.user.id, slug, title: contest.rows[0].title, ...result, at: new Date().toISOString() });
+        res.json(result);
+    } catch (error) {
+        await client.query('ROLLBACK');
+        throw error;
+    } finally { client.release(); }
+}));
+
+app.post('/api/admin/contests/:slug/open', auth, admin, asyncRoute(async (req, res) => {
+    const contest = await pool.query(`SELECT c.*,COUNT(cp.problem_slug)::int AS problem_count FROM contests c LEFT JOIN contest_problems cp ON cp.contest_id=c.id
+        WHERE c.slug=$1 GROUP BY c.id`, [req.params.slug]);
+    if (!contest.rowCount) return res.status(404).json({ error: 'Contest not found' });
+    if (contest.rows[0].status !== 'closed') return res.status(409).json({ error: 'Only a closed contest can be opened' });
+    if (!contest.rows[0].problem_count) return res.status(409).json({ error: 'Add at least one problem before opening the contest' });
+    const q = await pool.query(`UPDATE contests SET status='open',start_at=now(),end_at=now()+(duration_minutes*interval '1 minute'),updated_at=now()
+        WHERE slug=$1 RETURNING start_at,end_at`, [req.params.slug]);
+    res.json({ ok: true, ...q.rows[0] });
+}));
+
+app.post('/api/admin/contests/:slug/end', auth, admin, asyncRoute(async (req, res) => {
+    const q = await pool.query("UPDATE contests SET status='ended',end_at=LEAST(COALESCE(end_at,now()),now()),updated_at=now() WHERE slug=$1 AND status='open' RETURNING id", [req.params.slug]);
+    if (!q.rowCount) return res.status(409).json({ error: 'Contest is not open' });
+    res.json({ ok: true });
+}));
 async function atomicCopy(sourcePath, dir, filename) {
     const temporary = path.join(dir, `.${filename}.${randomUUID()}.tmp`);
     await copyFile(sourcePath, temporary);
@@ -506,10 +938,28 @@ app.post('/api/admin/problems/import-csv', auth, admin, rateLimit({windowMs:6000
         }
         if(groups.size>100) throw Error('Maximum 100 problems per import');
         const problems=[...groups.values()].map(row=>problemFields({...row,kind:'code',tests:JSON.stringify(row.tests)}));
+        const targetContestSlug=String(req.body?.contest_slug || '').trim();
         const client=await pool.connect();
         try {
             await client.query('BEGIN');
-            for(const problem of problems) await client.query('INSERT INTO problems(slug,data) VALUES($1,$2::jsonb)',[problem.slug,JSON.stringify(problem)]);
+            let targetContest=null;
+            let nextPosition=0;
+            if(targetContestSlug) {
+                const contest=await client.query("SELECT id,type,status FROM contests WHERE slug=$1 FOR UPDATE",[targetContestSlug]);
+                if(!contest.rowCount) throw Error('Target contest not found');
+                targetContest=contest.rows[0];
+                if(targetContest.status!=='closed') throw Error('Private exercises can only be imported into a closed contest');
+                if(targetContest.type!=='code') throw Error('Bulk Python import is only available for Function Code contests');
+                const position=await client.query('SELECT COALESCE(MAX(position),-1)+1 AS next_position FROM contest_problems WHERE contest_id=$1',[targetContest.id]);
+                nextPosition=Number(position.rows[0].next_position);
+            }
+            for(const problem of problems) {
+                await client.query('INSERT INTO problems(slug,data) VALUES($1,$2::jsonb)',[problem.slug,JSON.stringify(problem)]);
+                if(targetContest) {
+                    await client.query('INSERT INTO contest_problems(contest_id,problem_slug,position,label) VALUES($1,$2,$3,$4)',[targetContest.id,problem.slug,nextPosition,contestProblemLabel(nextPosition)]);
+                    nextPosition+=1;
+                }
+            }
             await client.query('COMMIT');
         } catch(e) { await client.query('ROLLBACK'); if(e.code==='23505') throw Error('A slug already exists; import canceled'); throw e }
         finally { client.release(); }
@@ -546,6 +996,15 @@ async function saveProblem(req, res, editing = false) {
         const existing = await pool.query('SELECT data,active FROM problems WHERE slug=$1', [data.slug]);
         if (!editing && existing.rowCount) return res.status(409).json({ error: 'Slug already exists' });
         if (editing && (!existing.rowCount || existing.rows[0].data.kind !== data.kind)) return res.status(400).json({ error: 'Problem not found or kind cannot be changed' });
+        const targetContestSlug = !editing ? String(req.body?.contest_slug || '').trim() : '';
+        let targetContest = null;
+        if (targetContestSlug) {
+            const contest = await pool.query("SELECT id,slug,title,type,status FROM contests WHERE slug=$1", [targetContestSlug]);
+            if (!contest.rowCount) return res.status(404).json({ error: 'Target contest not found' });
+            targetContest = contest.rows[0];
+            if (targetContest.status !== 'closed') return res.status(409).json({ error: 'Private exercises can only be added to a closed contest' });
+            if (targetContest.type !== data.kind) return res.status(400).json({ error: 'Exercise type must match the contest type' });
+        }
         if (data.kind === 'csv') {
             const truth = req.files?.ground_truth?.[0];
             const sample = req.files?.sample_submission?.[0];
@@ -592,10 +1051,24 @@ async function saveProblem(req, res, editing = false) {
             const r = await pool.query('UPDATE problems SET data=$2::jsonb,updated_at=now() WHERE slug=$1 RETURNING slug,active', [data.slug, JSON.stringify(data)]);
             if (!r.rowCount) return res.status(404).json({ error: 'Problem not found' });
         } else {
-            try { await pool.query('INSERT INTO problems(slug,data) VALUES($1,$2::jsonb)', [data.slug, JSON.stringify(data)]); }
-            catch (error) { if (error.code === '23505') return res.status(409).json({ error: 'Slug already exists' }); throw error; }
+            const client = await pool.connect();
+            try {
+                await client.query('BEGIN');
+                await client.query('INSERT INTO problems(slug,data) VALUES($1,$2::jsonb)', [data.slug, JSON.stringify(data)]);
+                if (targetContest) {
+                    const position = await client.query('SELECT COALESCE(MAX(position),-1)+1 AS next_position FROM contest_problems WHERE contest_id=$1', [targetContest.id]);
+                    const nextPosition = Number(position.rows[0].next_position);
+                    await client.query('INSERT INTO contest_problems(contest_id,problem_slug,position,label) VALUES($1,$2,$3,$4)', [targetContest.id, data.slug, nextPosition, contestProblemLabel(nextPosition)]);
+                }
+                await client.query('COMMIT');
+            } catch (error) {
+                await client.query('ROLLBACK');
+                if (error.code === '23505') return res.status(409).json({ error: 'Slug already exists' });
+                throw error;
+            } finally { client.release(); }
         }
-        res.status(editing ? 200 : 201).json({ problem: publicProblem(data), data_files: data.kind === 'csv' ? await publicDataFiles(data.slug) : [] });
+        if (data.kind === 'csv') await refreshNormalizedScores(data);
+        res.status(editing ? 200 : 201).json({ problem: publicProblem(data), contest: targetContest ? { slug: targetContest.slug, title: targetContest.title } : null, data_files: data.kind === 'csv' ? await publicDataFiles(data.slug) : [] });
     } finally {
         await cleanupUploads(req);
     }
@@ -644,10 +1117,48 @@ app.delete('/api/admin/problems/:slug/permanent', auth, admin, asyncRoute(async 
     console.info('admin permanent problem deletion', { admin_id: req.user.id, slug, submissions: submissionCount, files_removed: moved, cleanup_pending: cleanupPending, at: new Date().toISOString() });
     res.json({ ok: true, deleted_submissions: submissionCount, files_removed: moved, cleanup_pending: cleanupPending });
 }));
+app.delete('/api/admin/contests/:slug/problems/:problemSlug', auth, admin, asyncRoute(async (req, res) => {
+    const { slug: contestSlug, problemSlug } = req.params;
+    if (!validatePathSlug(contestSlug) || !validatePathSlug(problemSlug) || req.body?.confirm_slug !== problemSlug) return res.status(400).json({ error: 'Invalid deletion confirmation' });
+    const attached = await pool.query(`SELECT c.id AS contest_id,c.status,p.data FROM contests c
+        JOIN contest_problems cp ON cp.contest_id=c.id JOIN problems p ON p.slug=cp.problem_slug
+        WHERE c.slug=$1 AND cp.problem_slug=$2`, [contestSlug, problemSlug]);
+    if (!attached.rowCount) return res.status(404).json({ error: 'Contest exercise not found' });
+    if (attached.rows[0].status !== 'closed') return res.status(409).json({ error: 'Exercises can only be deleted while the contest is closed' });
+    const shared = await pool.query('SELECT 1 FROM contest_problems WHERE problem_slug=$1 AND contest_id<>$2 LIMIT 1', [problemSlug, attached.rows[0].contest_id]);
+    if (shared.rowCount) return res.status(409).json({ error: 'This exercise is also used by another contest and cannot be deleted here' });
+    const dir = challengeDir(csvRoot, problemSlug);
+    const trash = path.join(path.resolve(csvRoot), `.trash-${problemSlug}-${randomUUID()}`);
+    let moved = false;
+    if (attached.rows[0].data.kind === 'csv' && existsSync(dir)) { await rename(dir, trash); moved = true; }
+    const client = await pool.connect();
+    let submissionCount = 0;
+    try {
+        await client.query('BEGIN');
+        const submissions = await client.query('DELETE FROM submissions WHERE problem_slug=$1', [problemSlug]);
+        submissionCount = submissions.rowCount;
+        await client.query('DELETE FROM contest_problems WHERE contest_id=$1 AND problem_slug=$2', [attached.rows[0].contest_id, problemSlug]);
+        await client.query('DELETE FROM problems WHERE slug=$1', [problemSlug]);
+        const remaining = await client.query('SELECT problem_slug FROM contest_problems WHERE contest_id=$1 ORDER BY position', [attached.rows[0].contest_id]);
+        for (const [index, row] of remaining.rows.entries()) await client.query('UPDATE contest_problems SET position=$3,label=$4 WHERE contest_id=$1 AND problem_slug=$2', [attached.rows[0].contest_id, row.problem_slug, index, contestProblemLabel(index)]);
+        await client.query('COMMIT');
+    } catch (error) {
+        await client.query('ROLLBACK');
+        if (moved) await rename(trash, dir).catch(restoreError => console.error('contest problem file restore failed', restoreError));
+        throw error;
+    } finally { client.release(); }
+    let cleanupPending = false;
+    if (moved) {
+        try { await rm(trash, { recursive: true, force: true }); }
+        catch (error) { cleanupPending = true; console.error('contest problem file cleanup pending', { problemSlug, trash, error }); }
+    }
+    res.json({ ok: true, deleted_submissions: submissionCount, files_removed: moved, cleanup_pending: cleanupPending });
+}));
 app.use(async (err, req, res, _next) => {
     await cleanupUploads(req);
     console.error(err);
     const uploadLimit = ['LIMIT_FILE_SIZE', 'LIMIT_FILE_COUNT', 'LIMIT_UNEXPECTED_FILE'].includes(err.code);
-    res.status(uploadLimit ? 413 : 500).json({ error: uploadLimit ? `Upload exceeds the ${datasetMaxMb} MB challenge limit or allowed file count` : 'Request failed' });
+    const status = uploadLimit ? 413 : Number(err.statusCode) || 500;
+    res.status(status).json({ error: uploadLimit ? `Upload exceeds the ${datasetMaxMb} MB challenge limit or allowed file count` : status < 500 ? err.message : 'Request failed' });
 });
 await initialize(); server.listen(Number(process.env.PORT || 4000), '0.0.0.0', () => console.log('Platform API listening'));
