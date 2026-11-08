@@ -35,13 +35,18 @@ import {
   Trash2,
   ArchiveRestore,
   Star,
+  Bot,
+  MessageSquarePlus,
+  Send,
 } from "lucide-react";
 import MonacoEditor from "@monaco-editor/react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
+import rehypeHighlight from "rehype-highlight";
 import "katex/dist/katex.min.css";
+import "highlight.js/styles/atom-one-dark.css";
 import "./style.css";
 const API = "/api";
 const AUTH_EXPIRED_EVENT = "itclub-auth-expired";
@@ -112,6 +117,47 @@ async function request(path, options = {}) {
   }
   if (!r.ok) throw Error(j.error || `HTTP ${r.status}`);
   return j;
+}
+async function streamChatMessage(sessionId, message, onEvent) {
+  const token = localStorage.getItem("token");
+  const response = await fetch(`${API}/chat/sessions/${encodeURIComponent(sessionId)}/messages`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+    body: JSON.stringify({ message }),
+  });
+  if (response.status === 401 && token) {
+    clearStoredSession(AUTH_EXPIRED_MESSAGE);
+    window.location.replace("/login");
+    throw Error(AUTH_EXPIRED_MESSAGE);
+  }
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    throw Error(body.error || `HTTP ${response.status}`);
+  }
+  if (!response.body) throw Error("The chatbot returned an empty response stream");
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  const consume = (flush = false) => {
+    const normalized = buffer.replace(/\r\n/g, "\n");
+    const frames = normalized.split("\n\n");
+    buffer = flush ? "" : (frames.pop() || "");
+    frames.forEach(frame => {
+      const data = frame.split("\n").filter(line => line.startsWith("data:")).map(line => line.slice(5).trimStart()).join("\n");
+      if (data) onEvent(JSON.parse(data));
+    });
+  };
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    consume();
+  }
+  buffer += decoder.decode();
+  consume(true);
 }
 function formatBytes(bytes) {
   const value = Number(bytes) || 0;
@@ -212,6 +258,9 @@ function UserAvatar({ user, className = "" }) {
     </span>
   );
 }
+function ChatbotAvatar({ className = "" }) {
+  return <img className={`chatbot-avatar ${className}`.trim()} src="/favicon.png" alt="IT Club Arena Chatbot" />;
+}
 function App() {
   const [user, setUser] = useState(
     JSON.parse(localStorage.getItem("user") || "null"),
@@ -255,6 +304,11 @@ function App() {
             <NavLink to="/submissions">
               <Activity size={16} /> My submissions
             </NavLink>
+            {user?.role === "team" && (
+              <NavLink to="/chat">
+                <Bot size={16} /> Chatbot
+              </NavLink>
+            )}
             {user?.role === "admin" && (
               <NavLink to="/admin/contests">
                 <ShieldCheck size={16} /> Admin
@@ -319,6 +373,8 @@ function RouterContent({ user, setUser }) {
     return <SubmissionDetail id={p.split("/")[2]} user={user} />;
   if (p === "/admin/problems") return <AdminProblems user={user} />;
   if (p === "/admin/contests") return <AdminContests user={user} />;
+  if (segments[0] === "chat")
+    return <ChatPage user={user} sessionId={segments[1] ? decodeURIComponent(segments[1]) : null} />;
   if (p === "/ranklist") return <Ranklist />;
   if (p === "/contests") return <Contests user={user} />;
   if (segments[0] === "contests" && segments[2] === "problems" && segments[3])
@@ -330,6 +386,187 @@ function RouterContent({ user, setUser }) {
       <h2>Page not found</h2>
       <Link to="/problems">Browse problems</Link>
     </div>
+  );
+}
+function ChatPage({ user, sessionId }) {
+  const navigate = useNavigate();
+  const [sessions, setSessions] = useState([]);
+  const [activeSession, setActiveSession] = useState(null);
+  const [messages, setMessages] = useState([]);
+  const [message, setMessage] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [creating, setCreating] = useState(false);
+  const [configured, setConfigured] = useState(true);
+  const [model, setModel] = useState("gemini-3.5-flash-lite");
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+  const messageEnd = useRef(null);
+
+  const loadSessions = async (preferredId = sessionId) => {
+    const data = await request("/chat/sessions");
+    const next = data.sessions || [];
+    setSessions(next);
+    setConfigured(data.configured !== false);
+    setModel(data.model || "gemini-3.5-flash-lite");
+    if (!preferredId && next[0]) navigate(`/chat/${encodeURIComponent(next[0].id)}`, { replace: true });
+    return next;
+  };
+
+  useEffect(() => {
+    if (user?.role !== "team") return;
+    loadSessions().catch(e => setError(e.message));
+  }, [user?.id]);
+
+  useEffect(() => {
+    if (user?.role !== "team" || !sessionId) {
+      setActiveSession(null);
+      setMessages([]);
+      return;
+    }
+    let cancelled = false;
+    setError("");
+    request(`/chat/sessions/${encodeURIComponent(sessionId)}`).then(data => {
+      if (cancelled) return;
+      setActiveSession(data.session);
+      setMessages(data.messages || []);
+      setBusy(Boolean(data.session?.generating));
+      setNotice("");
+    }).catch(e => !cancelled && setError(e.message));
+    return () => { cancelled = true; };
+  }, [user?.id, sessionId]);
+
+  useEffect(() => {
+    messageEnd.current?.scrollIntoView({ behavior: busy ? "auto" : "smooth", block: "end" });
+  }, [messages, busy]);
+
+  const createSession = async () => {
+    setCreating(true);
+    setError("");
+    try {
+      const data = await request("/chat/sessions", { method: "POST", body: "{}" });
+      setSessions(current => [data.session, ...current]);
+      navigate(`/chat/${encodeURIComponent(data.session.id)}`);
+    } catch (e) { setError(e.message); }
+    finally { setCreating(false); }
+  };
+
+  const sendMessage = async () => {
+    const text = message.trim();
+    if (!text || !sessionId || busy || !configured || !activeSession?.remaining_tokens) return;
+    const stamp = Date.now();
+    const localUserId = `local-user-${stamp}`;
+    const localModelId = `local-model-${stamp}`;
+    setMessage("");
+    setError("");
+    setNotice("");
+    setBusy(true);
+    setMessages(current => [...current,
+      { id: localUserId, role: "user", content: text },
+      { id: localModelId, role: "model", content: "", pending: true },
+    ]);
+    try {
+      await streamChatMessage(sessionId, text, event => {
+        if (event.type === "delta") {
+          setMessages(current => current.map(item => item.id === localModelId
+            ? { ...item, content: item.content + event.text, pending: false }
+            : item));
+        }
+        if (event.type === "done") {
+          setActiveSession(event.session);
+          if (event.exhausted || event.finish_reason === "MAX_TOKENS") {
+            setNotice("This chat has reached its token limit. Create a new chat to continue.");
+          }
+        }
+        if (event.type === "error") throw Error(event.error);
+      });
+      const detail = await request(`/chat/sessions/${encodeURIComponent(sessionId)}`);
+      setActiveSession(detail.session);
+      setMessages(detail.messages || []);
+      await loadSessions(sessionId);
+    } catch (e) {
+      setMessages(current => current.filter(item => item.id !== localUserId && item.id !== localModelId));
+      setMessage(text);
+      setError(e.message);
+    } finally { setBusy(false); }
+  };
+
+  if (!user) return <div className="shell auth-required"><Bot size={34} /><h2>Sign in to use the team chatbot</h2><Link className="btn primary" to="/login">Login</Link></div>;
+  if (user.role !== "team") return <div className="shell auth-required"><Bot size={34} /><h2>Team accounts only</h2><p>The contest chatbot is available only to AI Tracks team accounts created by the organizers.</p></div>;
+
+  const remaining = Number(activeSession?.remaining_tokens ?? 2000);
+  const limit = Number(activeSession?.token_limit ?? 2000);
+  const remainingPercent = Math.max(0, Math.min(100, remaining * 100 / Math.max(1, limit)));
+  return (
+    <section className="shell chat-page">
+      <div className="chat-shell">
+        <aside className="chat-sidebar">
+          <div className="chat-sidebar-head">
+            <span><ChatbotAvatar /> IT Club Arena Chatbot</span>
+            <button className="chat-new-button" onClick={createSession} disabled={creating}>
+              <MessageSquarePlus size={17} /> {creating ? "Creating…" : "New chat"}
+            </button>
+          </div>
+          <div className="chat-session-list">
+            {sessions.map(item => (
+              <Link key={item.id} to={`/chat/${encodeURIComponent(item.id)}`} className={`chat-session-item${item.id === sessionId ? " active" : ""}`}>
+                <strong>{item.title}</strong>
+                <span>{item.remaining_tokens.toLocaleString()} tokens left</span>
+              </Link>
+            ))}
+            {!sessions.length && <p className="chat-sidebar-empty">No conversations yet.</p>}
+          </div>
+        </aside>
+        <div className="chat-main">
+          <header className="chat-header">
+            <div>
+              <h1>{activeSession?.title || "Team chatbot"}</h1>
+              <span>Powered by {model}</span>
+            </div>
+            {activeSession && <div className="chat-token-card">
+              <span><strong>{remaining.toLocaleString()}</strong> tokens remaining</span>
+              <div className="chat-token-track"><i style={{ width: `${remainingPercent}%` }} /></div>
+            </div>}
+          </header>
+          {!configured && <div className="chat-config-warning">The chatbot is not configured yet. An administrator must add the Gemini API key on the server.</div>}
+          {error && <div className="error chat-alert">{error}</div>}
+          {notice && <div className="chat-limit-notice">{notice}</div>}
+          {!activeSession ? (
+            <div className="chat-welcome">
+              <span className="chat-welcome-icon"><ChatbotAvatar /></span>
+              <h2>Start a new conversation</h2>
+              <p>Each chat has an independent allowance of 2,000 input and output tokens.</p>
+              <button className="btn primary" onClick={createSession} disabled={creating}><MessageSquarePlus size={18} /> New chat</button>
+            </div>
+          ) : <>
+            <div className="chat-messages">
+              {!messages.length && <div className="chat-welcome compact"><span className="chat-welcome-icon"><ChatbotAvatar /></span><h2>How can I help your team?</h2><p>Ask about code, modeling ideas, debugging or your contest workflow.</p></div>}
+              {messages.map(item => (
+                <article key={item.id} className={`chat-message ${item.role}`}>
+                  <div className="chat-message-avatar">{item.role === "user" ? <UserAvatar user={user} /> : <ChatbotAvatar />}</div>
+                  <div className="chat-message-body">
+                    <strong>{item.role === "user" ? user.username : "IT Club Arena Chatbot"}</strong>
+                    {item.pending && !item.content
+                      ? <span className="chat-typing"><i /><i /><i /></span>
+                      : <div className="markdown-content chat-markdown"><ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex, rehypeHighlight]}>{item.content}</ReactMarkdown></div>}
+                  </div>
+                </article>
+              ))}
+              <div ref={messageEnd} />
+            </div>
+            <div className="chat-composer-wrap">
+              {remaining <= 0 && <p className="chat-composer-hint">Token limit reached. Use <b>New chat</b> to continue.</p>}
+              <div className="chat-composer">
+                <textarea value={message} onChange={event => setMessage(event.target.value)} onKeyDown={event => {
+                  if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); sendMessage(); }
+                }} placeholder="Message IT Club Arena Chatbot…" rows={2} disabled={busy || !configured || remaining <= 0} />
+                <button onClick={sendMessage} disabled={!message.trim() || busy || !configured || remaining <= 0} title="Send message"><Send size={19} /></button>
+              </div>
+              <small>Enter to send · Shift + Enter for a new line · New chats receive a fresh 2,000-token allowance.</small>
+            </div>
+          </>}
+        </div>
+      </div>
+    </section>
   );
 }
 function Home() {

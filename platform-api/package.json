@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node server.js",
     "check": "node --check server.js",
-    "test": "node --test contest-rules.test.js problem-rules.test.js scoring.test.js"
+    "test": "node --test contest-rules.test.js problem-rules.test.js scoring.test.js gemini-client.test.js"
   },
   "dependencies": {
     "express": "^4.21.2",

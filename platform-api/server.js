@@ -16,6 +16,7 @@ import {parse as parseCsv} from 'csv-parse/sync';
 import { normalizeMetricScore, perfectScoreForMetric, scoreScale } from './scoring.js';
 import { contestAcceptsSubmissions, contestProblemLabel, effectiveContestStatus, roleCanEnterContest } from './contest-rules.js';
 import { normalizeProblemText, publicStarter } from './problem-rules.js';
+import { countGeminiTokens, streamGeminiResponse } from './gemini-client.js';
 
 const { Pool } = pg;
 const pool = new Pool({ connectionString: process.env.DATABASE_URL, max: 10 });
@@ -31,6 +32,9 @@ const sockets = new Map();
 const queue = []; let active = 0; const MAX_ACTIVE = 2; const MAX_QUEUE = 200;
 const workerUrl = process.env.RUST_WORKER_URL || 'http://rust-worker:3001';
 const csvUrl = process.env.CSV_JUDGE_URL || 'http://csv-judge:8100';
+const geminiApiKey = String(process.env.GEMINI_API_KEY || '').trim();
+const geminiModel = String(process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite').trim();
+const chatTokenLimit = Math.min(100000, Math.max(100, Number.parseInt(process.env.CHAT_TOKEN_LIMIT || '2000', 10) || 2000));
 const publicProblem = p => ({
     slug: p.slug,
     title: p.title,
@@ -70,6 +74,30 @@ function optionalAuth(req, _res, next) {
 }
 async function admin(req, res, next) {
     try { const q = await pool.query('SELECT role FROM users WHERE id=$1', [req.user.id]); if (q.rows[0]?.role !== 'admin') return res.status(403).json({ error: 'Administrator access required' }); next() } catch (e) { next(e) }
+}
+async function team(req, res, next) {
+    try { const q = await pool.query('SELECT role FROM users WHERE id=$1', [req.user.id]); if (q.rows[0]?.role !== 'team') return res.status(403).json({ error: 'A team account is required for the chatbot' }); next() } catch (e) { next(e) }
+}
+function chatSessionPayload(row) {
+    const tokenLimit = Number(row.token_limit);
+    const tokensUsed = Number(row.tokens_used);
+    return {
+        id: row.id,
+        title: row.title,
+        token_limit: tokenLimit,
+        tokens_used: tokensUsed,
+        remaining_tokens: Math.max(0, tokenLimit - tokensUsed),
+        generating: Boolean(row.generating),
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+    };
+}
+function chatTitle(message) {
+    const compact = String(message).replace(/\s+/g, ' ').trim();
+    return compact.slice(0, 72) || 'New chat';
+}
+function sendChatEvent(res, payload) {
+    if (!res.writableEnded && !res.destroyed) res.write(`data: ${JSON.stringify(payload)}\n\n`);
 }
 function send(socket, payload) { if (socket.readyState === 1) socket.send(JSON.stringify(payload)) }
 function broadcast(id, event) { for (const ws of sockets.get(id) || []) send(ws, event) }
@@ -363,6 +391,12 @@ async function initialize() {
     await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar TEXT");
     await pool.query(`CREATE TABLE IF NOT EXISTS problems(slug VARCHAR(80) PRIMARY KEY,data JSONB NOT NULL,active BOOLEAN NOT NULL DEFAULT TRUE,created_at TIMESTAMPTZ NOT NULL DEFAULT now(),updated_at TIMESTAMPTZ NOT NULL DEFAULT now())`);
     for (const p of seededProblems) { await pool.query('INSERT INTO problems(slug,data) VALUES($1,$2::jsonb) ON CONFLICT(slug) DO NOTHING', [p.slug, JSON.stringify(p)]) }
+    await pool.query(`UPDATE problems SET data=jsonb_set(data,'{description}',to_jsonb(replace(data->>'description',$2,$3)),false),updated_at=now()
+        WHERE slug=$1 AND data->>'description' LIKE '%' || $2 || '%'`, [
+        'oxford-pets-cat-dog',
+        'https://drive.google.com/file/d/1A7yj4NVrq68FR-ow6shdGT9K1CM5KODK/view?usp=sharing',
+        'https://drive.google.com/drive/folders/1F2Cu8tAJIjTbhAXMjG5jh1wHH8PXKldb?usp=sharing',
+    ]);
     for (const [slug, baseline] of Object.entries(legacyCompetitionBaselines)) {
         const problem = await pool.query('SELECT data FROM problems WHERE slug=$1', [slug]);
         if (!problem.rowCount || problem.rows[0].data.kind !== 'csv') continue;
@@ -395,6 +429,19 @@ async function initialize() {
     await pool.query(`CREATE TABLE IF NOT EXISTS contest_participants(
         contest_id UUID NOT NULL REFERENCES contests(id) ON DELETE CASCADE,user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
         joined_at TIMESTAMPTZ NOT NULL DEFAULT now(),PRIMARY KEY(contest_id,user_id))`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS chat_sessions(
+        id UUID PRIMARY KEY,user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,title VARCHAR(120) NOT NULL DEFAULT 'New chat',
+        token_limit INT NOT NULL DEFAULT 2000 CHECK(token_limit BETWEEN 100 AND 100000),tokens_used INT NOT NULL DEFAULT 0 CHECK(tokens_used >= 0),
+        generating BOOLEAN NOT NULL DEFAULT FALSE,created_at TIMESTAMPTZ NOT NULL DEFAULT now(),updated_at TIMESTAMPTZ NOT NULL DEFAULT now())`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS chat_messages(
+        id UUID PRIMARY KEY,ordinal BIGSERIAL UNIQUE,session_id UUID NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+        role VARCHAR(8) NOT NULL CHECK(role IN ('user','model')),content TEXT NOT NULL,token_count INT NOT NULL DEFAULT 0 CHECK(token_count >= 0),
+        finish_reason VARCHAR(40),created_at TIMESTAMPTZ NOT NULL DEFAULT now())`);
+    await pool.query('ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS ordinal BIGSERIAL');
+    await pool.query('CREATE INDEX IF NOT EXISTS chat_sessions_user_idx ON chat_sessions(user_id,updated_at DESC)');
+    await pool.query('CREATE UNIQUE INDEX IF NOT EXISTS chat_messages_ordinal_idx ON chat_messages(ordinal)');
+    await pool.query('CREATE INDEX IF NOT EXISTS chat_messages_session_idx ON chat_messages(session_id,ordinal)');
+    await pool.query('UPDATE chat_sessions SET generating=FALSE WHERE generating=TRUE');
     await pool.query(`CREATE TABLE IF NOT EXISTS submissions(id UUID PRIMARY KEY,user_id UUID NOT NULL REFERENCES users(id),problem_slug VARCHAR(100) NOT NULL,kind VARCHAR(10) NOT NULL,status VARCHAR(30) NOT NULL DEFAULT 'queued',code TEXT,passed INT NOT NULL DEFAULT 0,total INT NOT NULL DEFAULT 0,score DOUBLE PRECISION,metric VARCHAR(100),results JSONB NOT NULL DEFAULT '[]'::jsonb,error TEXT,created_at TIMESTAMPTZ NOT NULL DEFAULT now())`);
     await pool.query('ALTER TABLE submissions ADD COLUMN IF NOT EXISTS normalized_score DOUBLE PRECISION');
     await pool.query('ALTER TABLE submissions ADD COLUMN IF NOT EXISTS contest_id UUID REFERENCES contests(id) ON DELETE SET NULL');
@@ -421,6 +468,154 @@ app.post('/api/auth/login', asyncRoute(async (req, res) => {
     res.json({ token: tokenFor(u), user: { id: u.id, username: u.username, email: u.email, role: u.role, avatar: u.avatar } });
 }));
 app.get('/api/auth/me', auth, asyncRoute(async (req, res) => res.json({ user: await profileFor(req.user.id) })));
+app.get('/api/chat/sessions', auth, team, asyncRoute(async (req, res) => {
+    const result = await pool.query(`SELECT id,title,token_limit,tokens_used,generating,created_at,updated_at
+        FROM chat_sessions WHERE user_id=$1 ORDER BY updated_at DESC,id DESC`, [req.user.id]);
+    res.json({ sessions: result.rows.map(chatSessionPayload), configured: Boolean(geminiApiKey), model: geminiModel });
+}));
+app.post('/api/chat/sessions', auth, team, asyncRoute(async (req, res) => {
+    const result = await pool.query(`INSERT INTO chat_sessions(id,user_id,token_limit) VALUES($1,$2,$3)
+        RETURNING id,title,token_limit,tokens_used,generating,created_at,updated_at`, [randomUUID(), req.user.id, chatTokenLimit]);
+    res.status(201).json({ session: chatSessionPayload(result.rows[0]) });
+}));
+app.get('/api/chat/sessions/:id', auth, team, asyncRoute(async (req, res) => {
+    const session = await pool.query(`SELECT id,title,token_limit,tokens_used,generating,created_at,updated_at
+        FROM chat_sessions WHERE id=$1 AND user_id=$2`, [req.params.id, req.user.id]);
+    if (!session.rowCount) return res.status(404).json({ error: 'Chat session not found' });
+    const messages = await pool.query(`SELECT id,role,content,token_count,finish_reason,created_at
+        FROM chat_messages WHERE session_id=$1 ORDER BY ordinal`, [req.params.id]);
+    res.json({ session: chatSessionPayload(session.rows[0]), messages: messages.rows });
+}));
+app.post('/api/chat/sessions/:id/messages', auth, team, async (req, res) => {
+    const message = String(req.body?.message || '').trim();
+    if (!message || message.length > 12000) return res.status(400).json({ error: 'Message must contain 1–12,000 characters' });
+    if (!geminiApiKey) return res.status(503).json({ error: 'Chatbot is not configured. Ask an administrator to add GEMINI_API_KEY.' });
+
+    let lockedSession;
+    const lockClient = await pool.connect();
+    try {
+        await lockClient.query('BEGIN');
+        const selected = await lockClient.query(`SELECT id,title,token_limit,tokens_used,generating,created_at,updated_at
+            FROM chat_sessions WHERE id=$1 AND user_id=$2 FOR UPDATE`, [req.params.id, req.user.id]);
+        if (!selected.rowCount) {
+            await lockClient.query('ROLLBACK');
+            return res.status(404).json({ error: 'Chat session not found' });
+        }
+        lockedSession = selected.rows[0];
+        if (lockedSession.generating) {
+            await lockClient.query('ROLLBACK');
+            return res.status(409).json({ error: 'This chat is already generating a response' });
+        }
+        if (Number(lockedSession.tokens_used) >= Number(lockedSession.token_limit)) {
+            await lockClient.query('ROLLBACK');
+            return res.status(409).json({ error: `This chat has used all ${Number(lockedSession.token_limit).toLocaleString('en-US')} tokens. Create a new chat to continue.` });
+        }
+        await lockClient.query('UPDATE chat_sessions SET generating=TRUE WHERE id=$1', [lockedSession.id]);
+        await lockClient.query('COMMIT');
+    } catch (error) {
+        await lockClient.query('ROLLBACK').catch(() => {});
+        lockClient.release();
+        return res.status(500).json({ error: 'Could not lock this chat session' });
+    }
+    lockClient.release();
+
+    const abortController = new AbortController();
+    const timeout = setTimeout(() => abortController.abort(), 120000);
+    let responseOpen = true;
+    let output = '';
+    let finishReason = null;
+    let usageMetadata = null;
+    try {
+        const previous = await pool.query(`SELECT role,content FROM chat_messages WHERE session_id=$1 ORDER BY ordinal`, [lockedSession.id]);
+        const inputContents = [{ role: 'user', parts: [{ text: message }] }];
+        const inputTokens = await countGeminiTokens({
+            apiKey: geminiApiKey,
+            model: geminiModel,
+            contents: inputContents,
+            signal: abortController.signal,
+        });
+        const remaining = Number(lockedSession.token_limit) - Number(lockedSession.tokens_used);
+        if (inputTokens >= remaining) {
+            await pool.query('UPDATE chat_sessions SET generating=FALSE WHERE id=$1', [lockedSession.id]);
+            clearTimeout(timeout);
+            return res.status(400).json({ error: `This message needs ${inputTokens} tokens and leaves no room for a reply. ${remaining} tokens remain.` });
+        }
+        const outputBudget = remaining - inputTokens;
+        const contents = previous.rows.map(row => ({ role: row.role, parts: [{ text: row.content }] }));
+        contents.push(...inputContents);
+
+        res.status(200);
+        res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+        res.setHeader('Cache-Control', 'no-cache, no-transform');
+        res.setHeader('Connection', 'keep-alive');
+        res.setHeader('X-Accel-Buffering', 'no');
+        res.flushHeaders();
+        res.on('close', () => { responseOpen = false; });
+        sendChatEvent(res, { type: 'start', input_tokens: inputTokens, output_limit: outputBudget });
+
+        for await (const chunk of streamGeminiResponse({
+            apiKey: geminiApiKey,
+            model: geminiModel,
+            contents,
+            maxOutputTokens: outputBudget,
+            signal: abortController.signal,
+        })) {
+            if (chunk.text) {
+                output += chunk.text;
+                sendChatEvent(res, { type: 'delta', text: chunk.text });
+            }
+            if (chunk.finishReason) finishReason = chunk.finishReason;
+            if (chunk.usageMetadata) usageMetadata = chunk.usageMetadata;
+        }
+
+        let outputTokens = Number(usageMetadata?.candidatesTokenCount);
+        if ((!Number.isInteger(outputTokens) || outputTokens < 0) && output) {
+            outputTokens = await countGeminiTokens({
+                apiKey: geminiApiKey,
+                model: geminiModel,
+                contents: [{ role: 'model', parts: [{ text: output }] }],
+                signal: abortController.signal,
+            });
+        }
+        if (!Number.isInteger(outputTokens) || outputTokens < 0) outputTokens = 0;
+        outputTokens = Math.min(outputBudget, outputTokens);
+        if (finishReason === 'MAX_TOKENS') outputTokens = outputBudget;
+
+        const saveClient = await pool.connect();
+        let savedSession;
+        try {
+            await saveClient.query('BEGIN');
+            const current = await saveClient.query(`SELECT title FROM chat_sessions WHERE id=$1 AND user_id=$2 FOR UPDATE`, [lockedSession.id, req.user.id]);
+            if (!current.rowCount) throw new Error('Chat session disappeared while generating');
+            await saveClient.query(`INSERT INTO chat_messages(id,session_id,role,content,token_count) VALUES($1,$2,'user',$3,$4)`, [randomUUID(), lockedSession.id, message, inputTokens]);
+            if (output) await saveClient.query(`INSERT INTO chat_messages(id,session_id,role,content,token_count,finish_reason) VALUES($1,$2,'model',$3,$4,$5)`, [randomUUID(), lockedSession.id, output, outputTokens, finishReason]);
+            const title = current.rows[0].title === 'New chat' ? chatTitle(message) : current.rows[0].title;
+            const updated = await saveClient.query(`UPDATE chat_sessions SET title=$2,tokens_used=LEAST(token_limit,tokens_used+$3),generating=FALSE,updated_at=now()
+                WHERE id=$1 RETURNING id,title,token_limit,tokens_used,generating,created_at,updated_at`, [lockedSession.id, title, inputTokens + outputTokens]);
+            savedSession = chatSessionPayload(updated.rows[0]);
+            await saveClient.query('COMMIT');
+        } catch (error) {
+            await saveClient.query('ROLLBACK').catch(() => {});
+            throw error;
+        } finally { saveClient.release(); }
+
+        sendChatEvent(res, {
+            type: 'done',
+            session: savedSession,
+            output_tokens: outputTokens,
+            finish_reason: finishReason,
+            exhausted: savedSession.remaining_tokens === 0,
+        });
+        if (responseOpen && !res.writableEnded) res.end();
+    } catch (error) {
+        await pool.query('UPDATE chat_sessions SET generating=FALSE WHERE id=$1', [lockedSession.id]).catch(() => {});
+        console.error('Gemini chat generation failed', { session_id: lockedSession.id, model: geminiModel, error: error.message });
+        if (res.headersSent) {
+            sendChatEvent(res, { type: 'error', error: 'Gemini could not complete this response. Please try again.' });
+            if (responseOpen && !res.writableEnded) res.end();
+        } else res.status(502).json({ error: 'Gemini could not complete this response. Please try again.' });
+    } finally { clearTimeout(timeout); }
+});
 app.put('/api/auth/profile', auth, asyncRoute(async (req, res) => {
     const username = String(req.body?.username || '').trim();
     const email = String(req.body?.email || '').trim().toLowerCase();

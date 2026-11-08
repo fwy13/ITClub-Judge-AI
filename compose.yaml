@@ -26,6 +26,9 @@ services:
       ADMIN_BOOTSTRAP_PASSWORD: ${ADMIN_BOOTSTRAP_PASSWORD:-}
       CSV_PROBLEMS_DIR: /data/csv-problems
       DATASET_MAX_MB: ${DATASET_MAX_MB:-100}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.5-flash-lite}
+      CHAT_TOKEN_LIMIT: ${CHAT_TOKEN_LIMIT:-2000}
     volumes: [csvdata:/data/csv-problems, ./csv-judge/problems:/csv-bundled-problems:ro]
     depends_on:
       db: {condition: service_healthy}

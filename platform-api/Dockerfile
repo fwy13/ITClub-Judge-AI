@@ -2,7 +2,7 @@ FROM node:22-alpine
 WORKDIR /app
 COPY package*.json ./
 RUN npm install --omit=dev --no-audit --no-fund
-COPY server.js scoring.js contest-rules.js problem-rules.js problems.json ./
+COPY server.js scoring.js contest-rules.js problem-rules.js gemini-client.js problems.json ./
 USER node
 EXPOSE 4000
 CMD ["node", "server.js"]
